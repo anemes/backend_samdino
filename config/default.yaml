@@ -1,0 +1,87 @@
+# HITL Segmentation Backend Configuration
+
+# --- Model paths ---
+models:
+  dinov3:
+    path: "../../models/dinov3-vitl16-pretrain-sat493m"
+    patch_size: 16
+    num_register_tokens: 4
+    hidden_size: 1024
+    num_layers: 24
+    extract_layers: [6, 12, 18, 24]
+    # DINOv3-sat normalization
+    norm_mean: [0.430, 0.411, 0.296]
+    norm_std: [0.213, 0.156, 0.143]
+
+  sam3:
+    checkpoint: "../../models/sam3/sam3.pt"
+    bpe_path: null  # auto-resolve from sam3 package
+    resolution: 1008
+    confidence_threshold: 0.5
+
+# --- Data pipeline ---
+data:
+  bands: ["R", "G", "B"]
+  tile_size: 512
+  tile_overlap: 64
+  min_labeled_fraction: 0.05
+  background_class_id: 1
+  ignore_index: 0
+  val_fraction: 0.15
+  test_fraction: 0.15
+  # Spatial block size for train/val/test split (meters)
+  split_block_size: 500.0
+
+# --- Training ---
+training:
+  epochs: 50
+  batch_size: 4
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  scheduler: "cosine"
+  warmup_epochs: 5
+  mixed_precision: true
+  # Backbone fine-tuning
+  freeze_backbone: true
+  # UperNet head config
+  fpn_channels: 256
+  neck_out_channels: [256, 512, 1024, 1024]
+  neck_scale_factors: [4.0, 2.0, 1.0, 0.5]
+  # Early stopping
+  early_stopping_patience: 10
+  early_stopping_monitor: "val_mIoU"
+  # Augmentations
+  augmentations:
+    horizontal_flip: true
+    vertical_flip: true
+    rotate90: true
+    color_jitter: true
+    random_scale: [0.5, 2.0]
+
+# --- Inference ---
+inference:
+  tile_size: 512
+  tile_overlap: 128
+  batch_size: 8
+  output_confidence: true
+  output_vectors: true
+  vector_simplify_tolerance: 1.0
+
+# --- Paths ---
+paths:
+  project_dir: "./projects"
+  checkpoint_dir: "./checkpoints"
+  dataset_cache_dir: "./dataset_cache"
+  tile_cache_dir: "./tile_cache"
+
+# --- Server ---
+server:
+  host: "0.0.0.0"
+  port: 8000
+  dashboard_port: 7860
+
+# --- GPU ---
+gpu:
+  device: "cuda"
+  # Max VRAM to use (GB) - leave headroom for system
+  max_vram_gb: 22
