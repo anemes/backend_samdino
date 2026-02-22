@@ -119,6 +119,14 @@ class InferenceService:
             tiler = Tiler(patch_size=inf_cfg.tile_size, overlap=inf_cfg.tile_overlap)
             tiles, output_shape = tiler.tile(raster_source, aoi_bounds)
 
+            if len(tiles) == 0:
+                self._state.status = "error"
+                self._state.error_message = (
+                    "No tiles produced — AOI may be too small or outside raster extent"
+                )
+                logger.warning("Inference aborted: 0 tiles for bounds %s", aoi_bounds)
+                return
+
             self._state.tiles_total = len(tiles)
             logger.info("Inference: %d tiles to process", len(tiles))
 
