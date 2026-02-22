@@ -116,6 +116,17 @@ class GPUManager:
                 raise RuntimeError("SAM3 not loaded. Call acquire_sam3() first.")
             return self._sam3_model.inst_interactive_predictor
 
+    def get_sam3_model(self):
+        """Get the raw SAM3 model for predict_inst() calls.
+
+        Thread-safe: holds the lock while checking the model is loaded.
+        Requires SAM3 to be loaded via acquire_sam3() first.
+        """
+        with self._lock:
+            if self._active != ActiveModel.SAM3 or self._sam3_model is None:
+                raise RuntimeError("SAM3 not loaded. Call acquire_sam3() first.")
+            return self._sam3_model
+
     def acquire_segmentor(self, config, num_classes: int) -> "Segmentor":
         """Load segmentor onto GPU. Unloads any other model first.
 

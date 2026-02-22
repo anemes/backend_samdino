@@ -10,6 +10,25 @@ from pydantic import BaseModel
 router = APIRouter()
 
 
+def _round_geojson(geom_dict: dict, prec: int = 6) -> dict:
+    """Round coordinates in a GeoJSON geometry dict to *prec* decimal places.
+
+    Prevents 15-digit precision from rasterio reprojection reaching the
+    QGIS plugin, where it can overflow the WKT parser.
+    """
+    def _rc(c):
+        if not c:
+            return c
+        if isinstance(c[0], (int, float)):
+            return [round(v, prec) for v in c]
+        return [_rc(sub) for sub in c]
+
+    if "coordinates" in geom_dict:
+        geom_dict = dict(geom_dict)
+        geom_dict["coordinates"] = _rc(geom_dict["coordinates"])
+    return geom_dict
+
+
 class ClassDef(BaseModel):
     class_id: int
     name: str
@@ -65,7 +84,7 @@ def get_regions(crs: str = "EPSG:4326", store=Depends(get_label_store)):
     for _, row in regions.iterrows():
         features.append({
             "region_id": int(row["region_id"]),
-            "geometry": row.geometry.__geo_interface__,
+            "geometry": _round_geojson(row.geometry.__geo_interface__),
             "created_at": row.get("created_at", ""),
         })
     return {"regions": features, "count": len(features)}
@@ -93,7 +112,7 @@ def get_annotations(
             "region_id": int(row["region_id"]),
             "source": row.get("source", "manual"),
             "iteration": int(row.get("iteration", 0)),
-            "geometry": row.geometry.__geo_interface__,
+            "geometry": _round_geojson(row.geometry.__geo_interface__),
         })
     return {"annotations": features, "count": len(features)}
 

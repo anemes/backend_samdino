@@ -78,14 +78,26 @@ async def set_image(
     The image embeddings are computed and cached. Subsequent prompts
     reuse these cached embeddings for fast inference.
     """
-    # Save uploaded file to temp location
+    # Save uploaded file to a persistent location (NOT a temp file).
+    # mask_to_polygon() needs to re-open this file later to read the
+    # affine transform, so it must survive until the session is reset.
+    # The previous session's file is cleaned up when a new image arrives.
+    from ..app import app_state
+
+    upload_dir = Path(app_state.config.paths.dataset_cache_dir) / "sam_uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clean up previous upload
+    for old in upload_dir.glob("*"):
+        old.unlink(missing_ok=True)
+
     suffix = Path(file.filename).suffix if file.filename else ".tif"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = tmp.name
+    upload_path = upload_dir / f"sam_image{suffix}"
+    with open(upload_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
 
     try:
-        session = sam.set_image(tmp_path)
+        session = sam.set_image(str(upload_path))
         return {
             "status": "ok",
             "session_id": session.session_id,
@@ -93,7 +105,7 @@ async def set_image(
         }
     except Exception as e:
         logger.exception("SAM set_image failed: %s", e)
-        Path(tmp_path).unlink(missing_ok=True)
+        upload_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

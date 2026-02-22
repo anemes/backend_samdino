@@ -363,6 +363,14 @@ class TrainService:
             logger.exception("Training failed: %s", e)
             self._state.status = "error"
             self._state.error_message = str(e)
+        finally:
+            # Release GPU memory regardless of success or failure
+            try:
+                self.gpu._unload_all()
+            except Exception:
+                pass
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _train_epoch(self, model, loader, criterion, optimizer, scaler, use_amp) -> float:
         """Train for one epoch. Returns mean loss."""

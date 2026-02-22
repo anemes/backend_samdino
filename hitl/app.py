@@ -39,7 +39,11 @@ class AppState:
     active_project_id: Optional[str] = None
 
     def switch_project(self, project_id: str) -> None:
-        """Switch to a different project, updating label_store and registry."""
+        """Switch to a different project, updating label_store and registry.
+
+        Stops any running training before switching to prevent orphaned
+        threads and GPU memory leaks.
+        """
         pm = self.project_manager
         if pm is None:
             raise RuntimeError("ProjectManager not initialized")
@@ -47,6 +51,19 @@ class AppState:
         project_dir = pm.get_project_dir(project_id)
         if not project_dir.exists():
             raise ValueError(f"Project '{project_id}' does not exist")
+
+        # Stop running training on the old project before switching
+        if self.train_service.is_running:
+            logger.warning(
+                "Training is running on project '%s' — stopping before switch.",
+                self.active_project_id,
+            )
+            self.train_service.stop_training()
+            # Wait for the training thread to finish (up to 10s)
+            if self.train_service._thread is not None:
+                self.train_service._thread.join(timeout=10)
+                if self.train_service._thread.is_alive():
+                    logger.warning("Training thread did not stop within 10s")
 
         self.active_project_id = project_id
         self.label_store = LabelStore(project_dir / "labels.gpkg")
