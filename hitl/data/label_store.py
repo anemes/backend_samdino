@@ -68,6 +68,7 @@ class LabelStore:
                     "source",
                     "iteration",
                     "created_at",
+                    "status",
                 ],
                 geometry="geometry",
                 crs="EPSG:4326",
@@ -76,11 +77,20 @@ class LabelStore:
 
             # Create empty regions layer
             rgdf = gpd.GeoDataFrame(
-                columns=["geometry", "region_id", "created_at"],
+                columns=["geometry", "region_id", "created_at", "status"],
                 geometry="geometry",
                 crs="EPSG:4326",
             )
             rgdf.to_file(self.path, layer=self.REGIONS_LAYER, driver="GPKG")
+
+    @staticmethod
+    def _ensure_status_column(gdf: gpd.GeoDataFrame, default: str) -> gpd.GeoDataFrame:
+        """Add status column with default value if missing (backward compat)."""
+        if "status" not in gdf.columns:
+            gdf["status"] = default
+        else:
+            gdf["status"] = gdf["status"].fillna(default)
+        return gdf
 
     # --- Class operations ---
 
@@ -117,7 +127,9 @@ class LabelStore:
 
     # --- Region operations ---
 
-    def add_region(self, geometry_geojson: dict, crs: str = "EPSG:4326") -> int:
+    def add_region(
+        self, geometry_geojson: dict, crs: str = "EPSG:4326", status: str = "active",
+    ) -> int:
         """Add an annotation region. Returns assigned region_id."""
         existing = self.get_regions(crs=crs)
         region_id = len(existing) + 1
@@ -128,12 +140,14 @@ class LabelStore:
                     "geometry": shape(geometry_geojson),
                     "region_id": region_id,
                     "created_at": datetime.now().isoformat(),
+                    "status": status,
                 }
             ],
             crs=crs,
         )
 
         if len(existing) > 0:
+            existing = self._ensure_status_column(existing, "active")
             combined = gpd.GeoDataFrame(
                 data=list(existing.drop(columns="geometry").to_dict("records"))
                 + list(new_row.drop(columns="geometry").to_dict("records")),
@@ -144,19 +158,24 @@ class LabelStore:
             combined = new_row
 
         combined.to_file(self.path, layer=self.REGIONS_LAYER, driver="GPKG")
-        logger.info("Added annotation region %d", region_id)
+        logger.info("Added annotation region %d (status=%s)", region_id, status)
         return region_id
 
-    def get_regions(self, crs: str = "EPSG:4326") -> gpd.GeoDataFrame:
-        """Get all annotation regions."""
+    def get_regions(
+        self, crs: str = "EPSG:4326", status: Optional[str] = None,
+    ) -> gpd.GeoDataFrame:
+        """Get annotation regions, optionally filtered by status."""
         try:
             gdf = gpd.read_file(self.path, layer=self.REGIONS_LAYER)
+            gdf = self._ensure_status_column(gdf, "active")
             if len(gdf) > 0 and gdf.crs and gdf.crs.to_epsg() != int(crs.split(":")[1]):
                 gdf = gdf.to_crs(crs)
+            if status is not None and len(gdf) > 0:
+                gdf = gdf[gdf["status"] == status]
             return gdf
         except Exception:
             return gpd.GeoDataFrame(
-                columns=["geometry", "region_id", "created_at"],
+                columns=["geometry", "region_id", "created_at", "status"],
                 geometry="geometry",
                 crs=crs,
             )
@@ -171,6 +190,7 @@ class LabelStore:
         crs: str = "EPSG:4326",
         source: str = "manual",
         iteration: int = 0,
+        status: str = "approved",
     ) -> int:
         """Add a labeled polygon annotation. Returns row index."""
         existing = self.get_annotations(crs=crs)
@@ -184,12 +204,14 @@ class LabelStore:
                     "source": source,
                     "iteration": iteration,
                     "created_at": datetime.now().isoformat(),
+                    "status": status,
                 }
             ],
             crs=crs,
         )
 
         if len(existing) > 0:
+            existing = self._ensure_status_column(existing, "approved")
             combined = gpd.GeoDataFrame(
                 data=list(existing.drop(columns="geometry").to_dict("records"))
                 + list(new_row.drop(columns="geometry").to_dict("records")),
@@ -203,15 +225,21 @@ class LabelStore:
         return len(combined) - 1
 
     def get_annotations(
-        self, region_id: Optional[int] = None, crs: str = "EPSG:4326"
+        self,
+        region_id: Optional[int] = None,
+        crs: str = "EPSG:4326",
+        status: Optional[str] = None,
     ) -> gpd.GeoDataFrame:
-        """Get annotations, optionally filtered by region_id."""
+        """Get annotations, optionally filtered by region_id and/or status."""
         try:
             gdf = gpd.read_file(self.path, layer=self.ANNOTATIONS_LAYER)
+            gdf = self._ensure_status_column(gdf, "approved")
             if len(gdf) > 0 and gdf.crs and gdf.crs.to_epsg() != int(crs.split(":")[1]):
                 gdf = gdf.to_crs(crs)
             if region_id is not None and len(gdf) > 0:
                 gdf = gdf[gdf["region_id"] == region_id]
+            if status is not None and len(gdf) > 0:
+                gdf = gdf[gdf["status"] == status]
             return gdf
         except Exception:
             return gpd.GeoDataFrame(
@@ -222,6 +250,7 @@ class LabelStore:
                     "source",
                     "iteration",
                     "created_at",
+                    "status",
                 ],
                 geometry="geometry",
                 crs=crs,
@@ -288,3 +317,83 @@ class LabelStore:
                 stats[f"class_{c.name}_count"] = count
 
         return stats
+
+    # --- Review workflow ---
+
+    def get_region_status(self, region_id: int) -> str:
+        """Return the status of a specific region ('active' or 'in_review')."""
+        regions = self.get_regions()
+        match = regions[regions["region_id"] == region_id]
+        if len(match) == 0:
+            return "active"
+        return str(match.iloc[0].get("status", "active"))
+
+    def approve_region(self, region_id: int) -> int:
+        """Approve an in-review region and all its annotations.
+
+        Sets region status to 'active' and all its annotations to 'approved'.
+        Returns the number of annotations approved.
+        """
+        # Update region status
+        regions = self.get_regions()
+        mask = regions["region_id"] == region_id
+        if mask.sum() == 0:
+            raise ValueError(f"Region {region_id} not found")
+        regions.loc[mask, "status"] = "active"
+        regions.to_file(self.path, layer=self.REGIONS_LAYER, driver="GPKG")
+
+        # Update annotation statuses
+        annotations = self.get_annotations()
+        ann_mask = annotations["region_id"] == region_id
+        count = int(ann_mask.sum())
+        if count > 0:
+            annotations.loc[ann_mask, "status"] = "approved"
+            annotations.to_file(self.path, layer=self.ANNOTATIONS_LAYER, driver="GPKG")
+
+        logger.info("Approved region %d (%d annotations)", region_id, count)
+        return count
+
+    def add_annotations_bulk(
+        self,
+        geometries: list,
+        class_ids: list,
+        region_id: int,
+        crs: str = "EPSG:4326",
+        source: str = "inference",
+        iteration: int = 0,
+        status: str = "in_review",
+    ) -> int:
+        """Add multiple annotations at once. Returns count added."""
+        existing = self.get_annotations(crs=crs)
+        now = datetime.now().isoformat()
+
+        new_rows = gpd.GeoDataFrame(
+            [
+                {
+                    "geometry": geom,
+                    "class_id": cid,
+                    "region_id": region_id,
+                    "source": source,
+                    "iteration": iteration,
+                    "created_at": now,
+                    "status": status,
+                }
+                for geom, cid in zip(geometries, class_ids)
+            ],
+            crs=crs,
+        )
+
+        if len(existing) > 0:
+            existing = self._ensure_status_column(existing, "approved")
+            combined = gpd.GeoDataFrame(
+                data=list(existing.drop(columns="geometry").to_dict("records"))
+                + list(new_rows.drop(columns="geometry").to_dict("records")),
+                geometry=list(existing.geometry) + list(new_rows.geometry),
+                crs=crs,
+            )
+        else:
+            combined = new_rows
+
+        combined.to_file(self.path, layer=self.ANNOTATIONS_LAYER, driver="GPKG")
+        logger.info("Bulk added %d annotations to region %d", len(geometries), region_id)
+        return len(geometries)

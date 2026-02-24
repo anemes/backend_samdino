@@ -176,12 +176,17 @@ def accept_mask(
                    "Select the correct region or draw inside the region boundary.",
         )
 
+    # Inherit region status: annotations in an in_review region are also in_review
+    region_status = store.get_region_status(req.region_id)
+    ann_status = "in_review" if region_status == "in_review" else "approved"
+
     idx = store.add_annotation(
         geometry_geojson=polygon,
         class_id=req.class_id,
         region_id=req.region_id,
         crs=req.crs,
         source="sam3",
+        status=ann_status,
     )
 
     # Reset prompts for next object (keep image loaded)
