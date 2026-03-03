@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -367,6 +368,26 @@ class LabelStore:
         existing = self.get_annotations(crs=crs)
         now = datetime.now().isoformat()
 
+        # Filter out invalid geometries (empty or with non-finite coordinates)
+        valid_pairs = []
+        for geom, cid in zip(geometries, class_ids):
+            if geom is None or geom.is_empty:
+                continue
+            bounds = geom.bounds
+            if not all(math.isfinite(v) for v in bounds):
+                continue
+            valid_pairs.append((geom, cid))
+
+        skipped = len(geometries) - len(valid_pairs)
+        if skipped > 0:
+            logger.warning(
+                "Skipped %d geometries with invalid/non-finite coordinates", skipped,
+            )
+
+        if not valid_pairs:
+            logger.warning("No valid geometries to add after filtering")
+            return 0
+
         new_rows = gpd.GeoDataFrame(
             [
                 {
@@ -378,7 +399,7 @@ class LabelStore:
                     "created_at": now,
                     "status": status,
                 }
-                for geom, cid in zip(geometries, class_ids)
+                for geom, cid in valid_pairs
             ],
             crs=crs,
         )
@@ -395,5 +416,5 @@ class LabelStore:
             combined = new_rows
 
         combined.to_file(self.path, layer=self.ANNOTATIONS_LAYER, driver="GPKG")
-        logger.info("Bulk added %d annotations to region %d", len(geometries), region_id)
-        return len(geometries)
+        logger.info("Bulk added %d annotations to region %d", len(valid_pairs), region_id)
+        return len(valid_pairs)

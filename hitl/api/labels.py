@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
@@ -23,7 +24,7 @@ def _round_geojson(geom_dict: dict, prec: int = 6) -> dict:
         if not c:
             return c
         if isinstance(c[0], (int, float)):
-            return [round(v, prec) for v in c]
+            return [round(v, prec) if math.isfinite(v) else 0.0 for v in c]
         return [_rc(sub) for sub in c]
 
     if "coordinates" in geom_dict:
