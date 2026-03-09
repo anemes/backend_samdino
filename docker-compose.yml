@@ -1,0 +1,51 @@
+name: backend-samdino
+
+services:
+  backend-cpu:
+    profiles: ["cpu"]
+    platform: ${DOCKER_PLATFORM:-linux/amd64}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cpu
+        CPU_TORCH_ONLY: "1"
+    image: backend-samdino:latest
+    container_name: backend-samdino-cpu
+    ports:
+      - "8000:8000"
+      - "7860:7860"
+    volumes:
+      - ./config/default.docker.cpu.yaml:/app/config/default.yaml:ro
+      - ./models:/app/models
+      - ./projects:/app/projects
+      - ./checkpoints:/app/checkpoints
+      - ./dataset_cache:/app/dataset_cache
+      - ./tile_cache:/app/tile_cache
+    command: ["uvicorn", "hitl.app:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  backend-gpu:
+    profiles: ["gpu"]
+    platform: ${DOCKER_PLATFORM:-linux/amd64}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cu121
+        CPU_TORCH_ONLY: "0"
+    image: backend-samdino:latest
+    container_name: backend-samdino-gpu
+    ports:
+      - "8000:8000"
+      - "7860:7860"
+    volumes:
+      - ./config/default.docker.gpu.yaml:/app/config/default.yaml:ro
+      - ./models:/app/models
+      - ./projects:/app/projects
+      - ./checkpoints:/app/checkpoints
+      - ./dataset_cache:/app/dataset_cache
+      - ./tile_cache:/app/tile_cache
+    command: ["uvicorn", "hitl.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    gpus:
+      - driver: nvidia
+        count: all

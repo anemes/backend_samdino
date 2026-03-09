@@ -52,6 +52,62 @@ python -m hitl.app
 - API docs: `http://localhost:8000/docs`
 - Training dashboard: `http://localhost:7860`
 
+## Run With Docker
+
+### Prerequisites
+
+- Docker Desktop (Mac/Windows) or Docker Engine + Compose plugin (Linux)
+- Model weights present on host under `./models`:
+  - `./models/dinov3-vitl16-pretrain-sat493m/...`
+  - `./models/sam3/sam3.pt`
+- Docker image dependencies are installed with `uv sync --frozen` from `uv.lock`
+
+### CPU profile (Mac/Linux/Windows)
+
+```bash
+docker compose --profile cpu up --build
+```
+
+`docker-compose.yml` defaults containers to `linux/amd64` via `DOCKER_PLATFORM` so SAM3 works on Apple Silicon Macs.
+CPU profile installs PyTorch CPU wheels only and skips `nvidia-*` CUDA packages.
+
+If you want to force platform explicitly:
+
+```bash
+DOCKER_PLATFORM=linux/amd64 docker compose --profile cpu up --build
+```
+
+### GPU profile (Linux/Windows with NVIDIA)
+
+Requires NVIDIA Container Toolkit / WSL2 GPU integration.  
+GPU profile installs CUDA 12.1 PyTorch wheels.
+
+```bash
+docker compose --profile gpu up --build
+```
+
+If needed, force platform explicitly:
+
+```bash
+DOCKER_PLATFORM=linux/amd64 docker compose --profile gpu up --build
+```
+
+### Endpoints
+
+- REST API: `http://localhost:8000`
+- API docs: `http://localhost:8000/docs`
+- Training dashboard: `http://localhost:7860`
+
+### Persistent data
+
+The compose setup mounts these host directories for persistence:
+
+- `./models` -> `/app/models`
+- `./projects` -> `/app/projects`
+- `./checkpoints` -> `/app/checkpoints`
+- `./dataset_cache` -> `/app/dataset_cache`
+- `./tile_cache` -> `/app/tile_cache`
+
 ## Remote GPU (SSH tunnel)
 
 Run the backend on a GPU machine, access from a local QGIS client:
@@ -60,8 +116,8 @@ Run the backend on a GPU machine, access from a local QGIS client:
 # Local machine
 ssh -L 8000:localhost:8000 gpu-machine
 
-# GPU machine
-cd hitl-seg-backend && source .venv/bin/activate && python -m hitl.app
+# GPU machine (containerized)
+cd backend_samdino && docker compose --profile gpu up -d
 ```
 
 Then point the QGIS plugin at `http://localhost:8000`.

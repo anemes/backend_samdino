@@ -88,10 +88,65 @@ To use a remote GPU machine:
 ssh -L 8000:localhost:8000 your-gpu-machine
 
 # On the GPU machine, start the backend
-cd backend && python -m hitl.app
+cd backend_samdino && python -m hitl.app
 ```
 
 Then configure the QGIS plugin to connect to `http://localhost:8000`.
+
+## Docker Setup
+
+### 1. Prepare model files
+
+Create a `models/` directory in `backend_samdino` and place:
+
+- `models/dinov3-vitl16-pretrain-sat493m/...` (DINOv3 weights)
+- `models/sam3/sam3.pt` (SAM3 checkpoint)
+
+### 2. Start with Docker Compose
+
+CPU mode (Mac/Linux/Windows):
+
+```bash
+docker compose --profile cpu up --build
+```
+
+Docker installs dependencies using `uv sync --frozen` from `uv.lock`.
+
+Compose defaults to `linux/amd64` (`DOCKER_PLATFORM`) so SAM3 runs on Apple Silicon Macs.
+CPU profile installs PyTorch CPU wheels only and skips `nvidia-*` CUDA packages.
+
+Explicit override:
+
+```bash
+DOCKER_PLATFORM=linux/amd64 docker compose --profile cpu up --build
+```
+
+GPU mode (Linux/Windows NVIDIA):
+
+```bash
+docker compose --profile gpu up --build
+```
+
+Explicit override:
+
+```bash
+DOCKER_PLATFORM=linux/amd64 docker compose --profile gpu up --build
+```
+
+The backend is exposed at `http://localhost:8000` and dashboard at `http://localhost:7860`.
+
+### 3. Remote GPU with SSH tunnel (containerized)
+
+```bash
+# Local machine
+ssh -L 8000:localhost:8000 your-gpu-machine
+
+# GPU machine
+cd backend_samdino
+docker compose --profile gpu up -d
+```
+
+Then point QGIS plugin backend URL to `http://localhost:8000`.
 
 ## Quick Test
 
