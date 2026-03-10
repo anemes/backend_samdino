@@ -151,7 +151,7 @@ class SAMService:
 
         # Use predict_inst() which routes through the main Sam3Image model
         # This uses cached backbone features from set_image()
-        model = self._gpu._sam3_model
+        model = self._gpu.get_sam3_model()
         masks, iou_predictions, _ = model.predict_inst(
             session.inference_state,
             point_coords=pts,
@@ -264,6 +264,13 @@ class SAMService:
             from shapely.ops import transform as shapely_transform
             transformer = Transformer.from_crs(src_crs, dst_crs, always_xy=True)
             merged = shapely_transform(transformer.transform, merged)
+
+        # Round coordinates to 6 decimal places (~10 cm in EPSG:4326).
+        # rasterio pixel contours + reprojection produce 15-digit precision
+        # that bloats the WKT string to sizes that overflow QGIS's internal
+        # parser (std::vector larger than max_size()).
+        from shapely.wkt import loads as wkt_loads, dumps as wkt_dumps
+        merged = wkt_loads(wkt_dumps(merged, rounding_precision=6))
 
         return mapping(merged)
 

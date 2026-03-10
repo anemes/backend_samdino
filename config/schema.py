@@ -94,6 +94,7 @@ class ServerConfig(BaseModel):
 class GPUConfig(BaseModel):
     device: str = "cuda"
     max_vram_gb: float = 22
+    training_vram_overhead_gb: float = 4.0
 
 
 class AppConfig(BaseModel):

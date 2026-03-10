@@ -18,7 +18,7 @@ tile_cache/
 projects/
 
 # Model weights (large binaries — download separately)
-models/
+/models
 
 # Temp files
 *.tif

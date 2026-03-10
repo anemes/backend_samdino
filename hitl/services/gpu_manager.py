@@ -1,12 +1,13 @@
 """GPU model lifecycle manager.
 
-Manages exclusive GPU access for large models that cannot coexist in VRAM.
-SAM3 (~6GB) and the segmentor (~16GB) are mutually exclusive on a 24GB GPU.
+Manages GPU access for large models with dynamic coexistence support.
+SAM3 (~6GB) and the segmentor (~16GB) can coexist on GPUs with enough VRAM,
+or are mutually exclusive on smaller GPUs (controlled by max_vram_gb config).
 
 Usage:
     gpu = GPUManager(config)
-    processor = gpu.acquire_sam3()       # loads SAM3, unloads segmentor if needed
-    segmentor = gpu.acquire_segmentor()  # loads segmentor, unloads SAM3 if needed
+    processor = gpu.acquire_sam3()       # loads SAM3, evicts segmentor only if needed
+    segmentor = gpu.acquire_segmentor()  # loads segmentor, evicts SAM3 only if needed
 """
 
 from __future__ import annotations
@@ -27,17 +28,27 @@ class ActiveModel(Enum):
     SEGMENTOR = "segmentor"
 
 
-class GPUManager:
-    """Thread-safe GPU model manager with mutual exclusion.
+# Approximate VRAM footprint per model (GB)
+_MODEL_VRAM_GB = {
+    ActiveModel.SAM3: 6.0,
+    ActiveModel.SEGMENTOR: 16.0,
+}
 
-    Only one large model is loaded at a time. Switching models
-    requires unloading the current one first to free VRAM.
+
+class GPUManager:
+    """Thread-safe GPU model manager with dynamic coexistence.
+
+    On GPUs with enough VRAM (controlled by max_vram_gb), both SAM3 and the
+    segmentor stay loaded simultaneously. On smaller GPUs, models are evicted
+    as needed to fit within the VRAM budget.
     """
 
-    def __init__(self, device: str = "cuda"):
+    def __init__(self, config, device: str = "cuda"):
         self._lock = threading.Lock()
-        self._active = ActiveModel.NONE
+        self._loaded: set[ActiveModel] = set()
         self._device = device
+        self._max_vram_gb = config.gpu.max_vram_gb
+        self._training_overhead_gb = config.gpu.training_vram_overhead_gb
 
         # SAM3
         self._sam3_model = None
@@ -47,16 +58,134 @@ class GPUManager:
         self._segmentor = None
         self._segmentor_num_classes: Optional[int] = None
 
+        # Log coexistence mode
+        coexist_cost = _MODEL_VRAM_GB[ActiveModel.SAM3] + _MODEL_VRAM_GB[ActiveModel.SEGMENTOR]
+        if self._max_vram_gb >= coexist_cost + self._training_overhead_gb:
+            logger.info(
+                "VRAM budget %.1fGB: SAM3+Segmentor coexistence enabled (need %.1fGB)",
+                self._max_vram_gb, coexist_cost + self._training_overhead_gb,
+            )
+        else:
+            logger.info(
+                "VRAM budget %.1fGB: mutual exclusion mode (coexistence needs %.1fGB)",
+                self._max_vram_gb, coexist_cost + self._training_overhead_gb,
+            )
+
+        if torch.cuda.is_available():
+            physical_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            if self._max_vram_gb > physical_gb:
+                logger.warning(
+                    "max_vram_gb (%.1f) exceeds physical VRAM (%.1f) — risk of OOM",
+                    self._max_vram_gb, physical_gb,
+                )
+
     @property
     def active_model(self) -> ActiveModel:
-        return self._active
+        """Backward compat: returns the 'primary' active model."""
+        if ActiveModel.SEGMENTOR in self._loaded:
+            return ActiveModel.SEGMENTOR
+        if ActiveModel.SAM3 in self._loaded:
+            return ActiveModel.SAM3
+        return ActiveModel.NONE
+
+    @property
+    def loaded_models(self) -> frozenset:
+        """Set of currently loaded models."""
+        return frozenset(self._loaded)
 
     @property
     def device(self) -> str:
         return self._device
 
+    # ------------------------------------------------------------------
+    # VRAM budget helpers
+    # ------------------------------------------------------------------
+
+    def _vram_in_use(self) -> float:
+        """Estimate VRAM used by currently loaded models (GB)."""
+        return sum(_MODEL_VRAM_GB.get(m, 0) for m in self._loaded)
+
+    def _ensure_vram_for(self, target: ActiveModel, extra_overhead: float = 0.0) -> None:
+        """Evict models if needed to fit *target* within the VRAM budget.
+
+        Args:
+            target: The model we want to load.
+            extra_overhead: Additional VRAM needed (e.g. training batches).
+        """
+        if target in self._loaded:
+            return
+
+        needed = _MODEL_VRAM_GB[target] + extra_overhead
+        available = self._max_vram_gb - self._vram_in_use()
+
+        if available >= needed:
+            logger.info(
+                "VRAM budget: %.1fGB available, %.1fGB needed for %s — coexistence OK",
+                available, needed, target.value,
+            )
+            return
+
+        # Must evict. Evict models other than the target, largest first.
+        evict_candidates = sorted(
+            self._loaded,
+            key=lambda m: _MODEL_VRAM_GB.get(m, 0),
+            reverse=True,
+        )
+        for model in evict_candidates:
+            if model == target:
+                continue
+            self._unload_model(model)
+            available = self._max_vram_gb - self._vram_in_use()
+            if available >= needed:
+                break
+
+    # ------------------------------------------------------------------
+    # Per-model unload
+    # ------------------------------------------------------------------
+
+    def _unload_model(self, model: ActiveModel) -> None:
+        """Unload a specific model and free its VRAM."""
+        if model == ActiveModel.SAM3 and self._sam3_model is not None:
+            logger.info("Unloading SAM3...")
+            del self._sam3_processor
+            del self._sam3_model
+            self._sam3_processor = None
+            self._sam3_model = None
+            self._loaded.discard(ActiveModel.SAM3)
+
+        elif model == ActiveModel.SEGMENTOR and self._segmentor is not None:
+            logger.info("Unloading segmentor...")
+            del self._segmentor
+            self._segmentor = None
+            self._segmentor_num_classes = None
+            self._loaded.discard(ActiveModel.SEGMENTOR)
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _unload_all(self) -> None:
+        """Free all GPU models and clear VRAM cache."""
+        for model in list(self._loaded):
+            self._unload_model(model)
+        self._loaded.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # Public targeted unload
+    # ------------------------------------------------------------------
+
+    def unload_segmentor(self) -> None:
+        """Unload just the segmentor, preserving SAM3 if loaded."""
+        with self._lock:
+            self._unload_model(ActiveModel.SEGMENTOR)
+
+    # ------------------------------------------------------------------
+    # SAM3
+    # ------------------------------------------------------------------
+
     def acquire_sam3(self, config) -> "Sam3Processor":
-        """Load SAM3 onto GPU. Unloads any other model first.
+        """Load SAM3 onto GPU. Evicts other models only if VRAM budget requires it.
 
         Args:
             config: AppConfig with sam3 checkpoint path.
@@ -65,10 +194,10 @@ class GPUManager:
             Sam3Processor ready for inference.
         """
         with self._lock:
-            if self._active == ActiveModel.SAM3 and self._sam3_processor is not None:
+            if ActiveModel.SAM3 in self._loaded and self._sam3_processor is not None:
                 return self._sam3_processor
 
-            self._unload_all()
+            self._ensure_vram_for(ActiveModel.SAM3)
             logger.info("Loading SAM3 onto GPU...")
 
             # Deferred import to avoid loading sam3 at module level
@@ -101,7 +230,7 @@ class GPUManager:
                 device=self._device,
                 confidence_threshold=sam3_cfg.confidence_threshold,
             )
-            self._active = ActiveModel.SAM3
+            self._loaded.add(ActiveModel.SAM3)
             logger.info("SAM3 loaded successfully.")
             return self._sam3_processor
 
@@ -112,12 +241,28 @@ class GPUManager:
         Returns the SAM1-compatible interactive predictor.
         """
         with self._lock:
-            if self._active != ActiveModel.SAM3 or self._sam3_model is None:
+            if ActiveModel.SAM3 not in self._loaded or self._sam3_model is None:
                 raise RuntimeError("SAM3 not loaded. Call acquire_sam3() first.")
             return self._sam3_model.inst_interactive_predictor
 
-    def acquire_segmentor(self, config, num_classes: int) -> "Segmentor":
-        """Load segmentor onto GPU. Unloads any other model first.
+    def get_sam3_model(self):
+        """Get the raw SAM3 model for predict_inst() calls.
+
+        Thread-safe: holds the lock while checking the model is loaded.
+        Requires SAM3 to be loaded via acquire_sam3() first.
+        """
+        with self._lock:
+            if ActiveModel.SAM3 not in self._loaded or self._sam3_model is None:
+                raise RuntimeError("SAM3 not loaded. Call acquire_sam3() first.")
+            return self._sam3_model
+
+    # ------------------------------------------------------------------
+    # Segmentor
+    # ------------------------------------------------------------------
+
+    def acquire_segmentor(self, config, num_classes: int,
+                          training: bool = False) -> "Segmentor":
+        """Load segmentor onto GPU. Evicts other models only if VRAM budget requires it.
 
         If the segmentor is already loaded with the same num_classes, returns it.
         Otherwise rebuilds with the new class count.
@@ -125,19 +270,25 @@ class GPUManager:
         Args:
             config: AppConfig with DINOv3 path and training config.
             num_classes: Number of segmentation classes (including background).
+            training: If True, reserves extra VRAM for training batches/gradients.
 
         Returns:
             Segmentor model on GPU.
         """
         with self._lock:
             if (
-                self._active == ActiveModel.SEGMENTOR
+                ActiveModel.SEGMENTOR in self._loaded
                 and self._segmentor is not None
                 and self._segmentor_num_classes == num_classes
             ):
                 return self._segmentor
 
-            self._unload_all()
+            # If num_classes changed, unload existing segmentor first
+            if ActiveModel.SEGMENTOR in self._loaded and self._segmentor is not None:
+                self._unload_model(ActiveModel.SEGMENTOR)
+
+            overhead = self._training_overhead_gb if training else 0.0
+            self._ensure_vram_for(ActiveModel.SEGMENTOR, extra_overhead=overhead)
             logger.info("Loading segmentor onto GPU (num_classes=%d)...", num_classes)
 
             from .._models_build import build_segmentor
@@ -147,35 +298,16 @@ class GPUManager:
 
             self._segmentor = segmentor
             self._segmentor_num_classes = num_classes
-            self._active = ActiveModel.SEGMENTOR
+            self._loaded.add(ActiveModel.SEGMENTOR)
             logger.info("Segmentor loaded successfully.")
             return self._segmentor
 
     def get_segmentor(self) -> Optional["Segmentor"]:
         """Get the currently loaded segmentor, or None."""
         with self._lock:
-            if self._active == ActiveModel.SEGMENTOR:
+            if ActiveModel.SEGMENTOR in self._loaded:
                 return self._segmentor
             return None
-
-    def _unload_all(self) -> None:
-        """Free all GPU models and clear VRAM cache."""
-        if self._sam3_model is not None:
-            logger.info("Unloading SAM3...")
-            del self._sam3_processor
-            del self._sam3_model
-            self._sam3_processor = None
-            self._sam3_model = None
-
-        if self._segmentor is not None:
-            logger.info("Unloading segmentor...")
-            del self._segmentor
-            self._segmentor = None
-            self._segmentor_num_classes = None
-
-        self._active = ActiveModel.NONE
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
     def vram_usage_mb(self) -> float:
         """Current GPU memory usage in MB."""

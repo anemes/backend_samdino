@@ -228,7 +228,7 @@ class TrainService:
 
             # --- Load model ---
             self._state.status = "training"
-            model = self.gpu.acquire_segmentor(self.config, num_classes)
+            model = self.gpu.acquire_segmentor(self.config, num_classes, training=True)
 
             # Compute class weights from distribution
             class_weights = self._compute_class_weights(
@@ -363,6 +363,14 @@ class TrainService:
             logger.exception("Training failed: %s", e)
             self._state.status = "error"
             self._state.error_message = str(e)
+        finally:
+            # Release segmentor GPU memory; keep SAM3 loaded if present
+            try:
+                self.gpu.unload_segmentor()
+            except Exception:
+                pass
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _train_epoch(self, model, loader, criterion, optimizer, scaler, use_amp) -> float:
         """Train for one epoch. Returns mean loss."""

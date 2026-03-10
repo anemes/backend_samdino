@@ -2,12 +2,35 @@
 
 from __future__ import annotations
 
+import logging
+import math
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from pydantic import BaseModel
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+
+def _round_geojson(geom_dict: dict, prec: int = 6) -> dict:
+    """Round coordinates in a GeoJSON geometry dict to *prec* decimal places.
+
+    Prevents 15-digit precision from rasterio reprojection reaching the
+    QGIS plugin, where it can overflow the WKT parser.
+    """
+    def _rc(c):
+        if not c:
+            return c
+        if isinstance(c[0], (int, float)):
+            return [round(v, prec) if math.isfinite(v) else 0.0 for v in c]
+        return [_rc(sub) for sub in c]
+
+    if "coordinates" in geom_dict:
+        geom_dict = dict(geom_dict)
+        geom_dict["coordinates"] = _rc(geom_dict["coordinates"])
+    return geom_dict
 
 
 class ClassDef(BaseModel):
@@ -65,8 +88,9 @@ def get_regions(crs: str = "EPSG:4326", store=Depends(get_label_store)):
     for _, row in regions.iterrows():
         features.append({
             "region_id": int(row["region_id"]),
-            "geometry": row.geometry.__geo_interface__,
+            "geometry": _round_geojson(row.geometry.__geo_interface__),
             "created_at": row.get("created_at", ""),
+            "status": row.get("status", "active"),
         })
     return {"regions": features, "count": len(features)}
 
@@ -82,10 +106,11 @@ def add_region(req: RegionRequest, store=Depends(get_label_store)):
 @router.get("/annotations")
 def get_annotations(
     region_id: Optional[int] = None,
+    status: Optional[str] = None,
     crs: str = "EPSG:4326",
     store=Depends(get_label_store),
 ):
-    annotations = store.get_annotations(region_id=region_id, crs=crs)
+    annotations = store.get_annotations(region_id=region_id, crs=crs, status=status)
     features = []
     for _, row in annotations.iterrows():
         features.append({
@@ -93,7 +118,8 @@ def get_annotations(
             "region_id": int(row["region_id"]),
             "source": row.get("source", "manual"),
             "iteration": int(row.get("iteration", 0)),
-            "geometry": row.geometry.__geo_interface__,
+            "geometry": _round_geojson(row.geometry.__geo_interface__),
+            "status": row.get("status", "approved"),
         })
     return {"annotations": features, "count": len(features)}
 
@@ -109,6 +135,9 @@ def add_annotation(req: AnnotationRequest, store=Depends(get_label_store)):
             detail=f"Annotation centroid is outside region {req.region_id}. "
                    "Draw inside the region boundary or select the correct region.",
         )
+    # Inherit region status: annotations in an in_review region are also in_review
+    status = store.get_region_status(req.region_id)
+    ann_status = "in_review" if status == "in_review" else "approved"
     idx = store.add_annotation(
         geometry_geojson=req.geometry_geojson,
         class_id=req.class_id,
@@ -116,6 +145,7 @@ def add_annotation(req: AnnotationRequest, store=Depends(get_label_store)):
         crs=req.crs,
         source=req.source,
         iteration=req.iteration,
+        status=ann_status,
     )
     return {"index": idx}
 
@@ -138,6 +168,90 @@ def delete_region(region_id: int, store=Depends(get_label_store)):
 def delete_region_annotations(region_id: int, store=Depends(get_label_store)):
     deleted = store.delete_annotations_in_region(region_id)
     return {"deleted": deleted}
+
+
+# --- Review workflow ---
+
+
+class PromoteInferenceRequest(BaseModel):
+    aoi_geojson: dict  # Full AOI polygon GeoJSON geometry
+    job_id: str  # Inference job ID to promote from
+
+
+@router.post("/promote-inference")
+def promote_inference(req: PromoteInferenceRequest, store=Depends(get_label_store)):
+    """Promote inference results to in-review annotations.
+
+    Creates a region (status='in_review') from the AOI polygon, then
+    reads the prediction GeoPackage and inserts all non-background polygons
+    as annotations (status='in_review').
+    """
+    import geopandas as gpd
+    from ..app import app_state
+
+    inf_state = app_state.inference_service.state
+    if inf_state.job_id != req.job_id:
+        raise HTTPException(status_code=404, detail=f"Job '{req.job_id}' not found")
+    if inf_state.status != "complete":
+        raise HTTPException(
+            status_code=409, detail=f"Job status: {inf_state.status}"
+        )
+
+    vec_path = inf_state.result_paths.get("vector")
+    if not vec_path:
+        raise HTTPException(status_code=404, detail="No vector results for this job")
+
+    # Create the review region from AOI polygon
+    region_id = store.add_region(req.aoi_geojson, crs="EPSG:4326", status="in_review")
+
+    # Read prediction GeoPackage
+    pred_gdf = gpd.read_file(vec_path)
+
+    # Reproject to EPSG:4326 for storage
+    if pred_gdf.crs and pred_gdf.crs.to_epsg() != 4326:
+        pred_gdf = pred_gdf.to_crs("EPSG:4326")
+
+    # Filter out class_id < 2 (ignore=0 and background=1)
+    pred_gdf = pred_gdf[pred_gdf["class_id"] >= 2]
+
+    if len(pred_gdf) == 0:
+        return {
+            "region_id": region_id,
+            "annotations_created": 0,
+            "message": "Region created but no class predictions to promote",
+        }
+
+    # Round coordinates to 6 decimal places to avoid WKT parser overflow
+    from shapely import wkt as shapely_wkt
+
+    pred_gdf["geometry"] = pred_gdf["geometry"].apply(
+        lambda g: shapely_wkt.loads(shapely_wkt.dumps(g, rounding_precision=6))
+    )
+
+    # Bulk insert as in_review annotations
+    count = store.add_annotations_bulk(
+        geometries=list(pred_gdf.geometry),
+        class_ids=[int(c) for c in pred_gdf["class_id"]],
+        region_id=region_id,
+        source="inference",
+        status="in_review",
+    )
+
+    logger.info(
+        "Promoted inference job %s: region %d, %d annotations",
+        req.job_id, region_id, count,
+    )
+    return {"region_id": region_id, "annotations_created": count}
+
+
+@router.post("/regions/{region_id}/approve")
+def approve_region(region_id: int, store=Depends(get_label_store)):
+    """Approve an in-review region and all its annotations for training."""
+    try:
+        count = store.approve_region(region_id)
+        return {"status": "ok", "region_id": region_id, "annotations_approved": count}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.get("/stats")

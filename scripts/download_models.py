@@ -27,15 +27,13 @@ MODELS = {
         "description": "DINOv3 ViT-L pretrained on 493M satellite images",
     },
     "sam3": {
-        "url": "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt",
+        "repo_id": "facebook/sam3",
         "local_subdir": "sam3",
-        "filename": "sam3.pt",
-        "description": "SAM3 (SAM2.1) Hiera Large checkpoint",
+        "description": "SAM3 checkpoint from HuggingFace",
     },
 }
 
 DEFAULT_MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
-MIN_SAM3_BYTES = 10 * 1024 * 1024  # sanity check: at least 10 MB
 
 
 def _has_nonempty_file(path: Path) -> bool:
@@ -58,13 +56,11 @@ def verify_dinov3(local_dir: Path) -> bool:
     return config_ok and weights_ok
 
 
-def verify_sam3(output_path: Path) -> bool:
-    """Return True when SAM3 checkpoint file exists and is non-trivially sized."""
-    return (
-        output_path.exists()
-        and output_path.is_file()
-        and output_path.stat().st_size >= MIN_SAM3_BYTES
-    )
+def verify_sam3(local_dir: Path) -> bool:
+    """Return True when the SAM3 snapshot looks complete enough to use."""
+    checkpoint_ok = _has_nonempty_file(local_dir / "sam3.pt")
+    config_ok = _has_nonempty_file(local_dir / "config.json")
+    return checkpoint_ok and config_ok
 
 
 def download_dinov3(models_dir: Path, token: str | None = None) -> None:
@@ -95,29 +91,32 @@ def download_dinov3(models_dir: Path, token: str | None = None) -> None:
     print(f"  Done: {local_dir}")
 
 
-def download_sam3(models_dir: Path) -> None:
-    """Download SAM3 checkpoint."""
-    import urllib.request
+def download_sam3(models_dir: Path, token: str | None = None) -> None:
+    """Download SAM3 snapshot from HuggingFace."""
+    from huggingface_hub import snapshot_download
 
     info = MODELS["sam3"]
     local_dir = models_dir / info["local_subdir"]
-    local_dir.mkdir(parents=True, exist_ok=True)
-    output_path = local_dir / info["filename"]
 
-    if verify_sam3(output_path):
-        print(f"  SAM3 already verified at {output_path}, skipping.")
+    if verify_sam3(local_dir):
+        print(f"  SAM3 already verified at {local_dir}, skipping.")
         return
-    if output_path.exists():
-        print(f"  Existing SAM3 checkpoint is incomplete at {output_path}; re-downloading...")
+    if local_dir.exists():
+        print(f"  Existing SAM3 directory is incomplete at {local_dir}; re-downloading...")
 
-    print(f"  Downloading SAM3 from {info['url']}...")
-    urllib.request.urlretrieve(info["url"], str(output_path))
-    if not verify_sam3(output_path):
+    print(f"  Downloading {info['repo_id']}...")
+    snapshot_download(
+        repo_id=info["repo_id"],
+        local_dir=str(local_dir),
+        token=token,
+        resume_download=True,
+    )
+    if not verify_sam3(local_dir):
         raise RuntimeError(
-            "SAM3 checkpoint download appears incomplete. "
-            "Delete the file and retry."
+            "SAM3 download appears incomplete. "
+            "Check Hugging Face authentication/permissions and retry."
         )
-    print(f"  Done: {output_path}")
+    print(f"  Done: {local_dir}")
 
 
 def main() -> int:
@@ -146,7 +145,7 @@ def main() -> int:
 
         if download_all or args.sam3:
             print(f"[SAM3] {MODELS['sam3']['description']}")
-            download_sam3(models_dir)
+            download_sam3(models_dir, token=args.token)
             print()
     except Exception as exc:
         print(f"Download failed: {exc}", file=sys.stderr)
