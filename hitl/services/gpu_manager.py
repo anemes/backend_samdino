@@ -120,7 +120,7 @@ class GPUManager:
 
         if available >= needed:
             logger.info(
-                "VRAM budget: %.1fGB available, %.1fGB needed for %s — coexistence OK",
+                "VRAM budget: %.1fGB available, %.1fGB needed for %s",
                 available, needed, target.value,
             )
             return
