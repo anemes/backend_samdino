@@ -27,14 +27,40 @@ MODELS = {
         "description": "DINOv3 ViT-L pretrained on 493M satellite images",
     },
     "sam3": {
-        "url": "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt",
+        "repo_id": "facebook/sam3",
         "local_subdir": "sam3",
-        "filename": "sam3.pt",
-        "description": "SAM3 (SAM2.1) Hiera Large checkpoint",
+        "description": "SAM3 checkpoint from HuggingFace",
     },
 }
 
 DEFAULT_MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
+
+
+def _has_nonempty_file(path: Path) -> bool:
+    return path.exists() and path.is_file() and path.stat().st_size > 0
+
+
+def _find_any_weight_file(root: Path) -> bool:
+    patterns = ("*.safetensors", "*.bin", "*.pt", "*.pth")
+    for pattern in patterns:
+        for f in root.rglob(pattern):
+            if _has_nonempty_file(f):
+                return True
+    return False
+
+
+def verify_dinov3(local_dir: Path) -> bool:
+    """Return True when the DINOv3 snapshot looks complete enough to use."""
+    config_ok = _has_nonempty_file(local_dir / "config.json")
+    weights_ok = _find_any_weight_file(local_dir)
+    return config_ok and weights_ok
+
+
+def verify_sam3(local_dir: Path) -> bool:
+    """Return True when the SAM3 snapshot looks complete enough to use."""
+    checkpoint_ok = _has_nonempty_file(local_dir / "sam3.pt")
+    config_ok = _has_nonempty_file(local_dir / "config.json")
+    return checkpoint_ok and config_ok
 
 
 def download_dinov3(models_dir: Path, token: str | None = None) -> None:
@@ -44,9 +70,11 @@ def download_dinov3(models_dir: Path, token: str | None = None) -> None:
     info = MODELS["dinov3"]
     local_dir = models_dir / info["local_subdir"]
 
-    if local_dir.exists() and any(local_dir.iterdir()):
-        print(f"  DINOv3 already exists at {local_dir}, skipping.")
+    if verify_dinov3(local_dir):
+        print(f"  DINOv3 already verified at {local_dir}, skipping.")
         return
+    if local_dir.exists():
+        print(f"  Existing DINOv3 directory is incomplete at {local_dir}; re-downloading...")
 
     print(f"  Downloading {info['repo_id']}...")
     snapshot_download(
@@ -55,25 +83,40 @@ def download_dinov3(models_dir: Path, token: str | None = None) -> None:
         token=token,
         resume_download=True,
     )
+    if not verify_dinov3(local_dir):
+        raise RuntimeError(
+            "DINOv3 download appears incomplete. "
+            "Check Hugging Face authentication/permissions and retry."
+        )
     print(f"  Done: {local_dir}")
 
 
-def download_sam3(models_dir: Path) -> None:
-    """Download SAM3 checkpoint."""
-    import urllib.request
+def download_sam3(models_dir: Path, token: str | None = None) -> None:
+    """Download SAM3 snapshot from HuggingFace."""
+    from huggingface_hub import snapshot_download
 
     info = MODELS["sam3"]
     local_dir = models_dir / info["local_subdir"]
-    local_dir.mkdir(parents=True, exist_ok=True)
-    output_path = local_dir / info["filename"]
 
-    if output_path.exists():
-        print(f"  SAM3 already exists at {output_path}, skipping.")
+    if verify_sam3(local_dir):
+        print(f"  SAM3 already verified at {local_dir}, skipping.")
         return
+    if local_dir.exists():
+        print(f"  Existing SAM3 directory is incomplete at {local_dir}; re-downloading...")
 
-    print(f"  Downloading SAM3 from {info['url']}...")
-    urllib.request.urlretrieve(info["url"], str(output_path))
-    print(f"  Done: {output_path}")
+    print(f"  Downloading {info['repo_id']}...")
+    snapshot_download(
+        repo_id=info["repo_id"],
+        local_dir=str(local_dir),
+        token=token,
+        resume_download=True,
+    )
+    if not verify_sam3(local_dir):
+        raise RuntimeError(
+            "SAM3 download appears incomplete. "
+            "Check Hugging Face authentication/permissions and retry."
+        )
+    print(f"  Done: {local_dir}")
 
 
 def main() -> int:
@@ -94,15 +137,19 @@ def main() -> int:
 
     print(f"Models directory: {models_dir}\n")
 
-    if download_all or args.dinov3:
-        print(f"[DINOv3] {MODELS['dinov3']['description']}")
-        download_dinov3(models_dir, token=args.token)
-        print()
+    try:
+        if download_all or args.dinov3:
+            print(f"[DINOv3] {MODELS['dinov3']['description']}")
+            download_dinov3(models_dir, token=args.token)
+            print()
 
-    if download_all or args.sam3:
-        print(f"[SAM3] {MODELS['sam3']['description']}")
-        download_sam3(models_dir)
-        print()
+        if download_all or args.sam3:
+            print(f"[SAM3] {MODELS['sam3']['description']}")
+            download_sam3(models_dir, token=args.token)
+            print()
+    except Exception as exc:
+        print(f"Download failed: {exc}", file=sys.stderr)
+        return 1
 
     print("All requested models downloaded.")
     return 0

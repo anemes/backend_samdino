@@ -97,7 +97,7 @@ async def lifespan(app: FastAPI):
     Path(config.paths.tile_cache_dir).mkdir(parents=True, exist_ok=True)
 
     # Initialize services
-    gpu_manager = GPUManager(device=config.gpu.device)
+    gpu_manager = GPUManager(config, device=config.gpu.device)
 
     # Project manager
     project_manager = ProjectManager(config.paths.project_dir)

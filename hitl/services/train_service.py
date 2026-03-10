@@ -228,7 +228,7 @@ class TrainService:
 
             # --- Load model ---
             self._state.status = "training"
-            model = self.gpu.acquire_segmentor(self.config, num_classes)
+            model = self.gpu.acquire_segmentor(self.config, num_classes, training=True)
 
             # Compute class weights from distribution
             class_weights = self._compute_class_weights(
@@ -364,9 +364,9 @@ class TrainService:
             self._state.status = "error"
             self._state.error_message = str(e)
         finally:
-            # Release GPU memory regardless of success or failure
+            # Release segmentor GPU memory; keep SAM3 loaded if present
             try:
-                self.gpu._unload_all()
+                self.gpu.unload_segmentor()
             except Exception:
                 pass
             if torch.cuda.is_available():

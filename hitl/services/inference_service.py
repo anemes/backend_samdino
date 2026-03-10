@@ -193,3 +193,11 @@ class InferenceService:
             logger.exception("Inference failed: %s", e)
             self._state.status = "error"
             self._state.error_message = str(e)
+        finally:
+            # Release segmentor GPU memory; keep SAM3 loaded if present
+            try:
+                self.gpu.unload_segmentor()
+            except Exception:
+                pass
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
