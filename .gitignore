@@ -11,14 +11,8 @@ build/
 venv/
 env/
 
-# Runtime data (created by the server, not tracked)
-checkpoints/
-dataset_cache/
-tile_cache/
-projects/
-
-# Model weights (large binaries — download separately)
-/models
+# Runtime data and model weights (created/downloaded, not tracked)
+data/
 
 # Temp files
 *.tif

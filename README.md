@@ -55,7 +55,7 @@ Edit `config/default.yaml`:
 - `server.port` — API port (default 8000)
 - `gpu.device` — `cuda` or `cpu`
 
-Model weights are not included in the repo. Place them in a `models/` directory (gitignored) or point the config to an external path.
+Model weights are not included in the repo. Place them in `data/models/` (gitignored) or point the config to an external path.
 
 ## Run
 
@@ -72,18 +72,20 @@ python -m hitl.app
 ### Prerequisites
 
 - Docker Desktop (Mac/Windows) or Docker Engine + Compose plugin (Linux)
-- Model weights present on host under `./models`:
-  - `./models/dinov3-vitl16-pretrain-sat493m/...`
-  - `./models/sam3/sam3.pt`
+- Model weights present on host under `./data/models`:
+  - `./data/models/dinov3-vitl16-pretrain-sat493m/...`
+  - `./data/models/sam3/sam3.pt`
 - Docker image dependencies are installed with `uv sync --frozen` from `uv.lock`
 
 ### First-time setup
 
-Create the data directories before the first build so Docker doesn't create them as root:
+Create the data directory before the first build so Docker doesn't create it as root:
 
 ```bash
-mkdir -p models projects checkpoints dataset_cache tile_cache
+mkdir -p data/models
 ```
+
+All runtime data (projects, checkpoints, caches) is stored under `data/` and shared between local and Docker runs.
 
 ### CPU profile (Mac/Linux/Windows)
 
@@ -123,13 +125,7 @@ DOCKER_PLATFORM=linux/amd64 docker compose --profile gpu up --build
 
 ### Persistent data
 
-The compose setup mounts these host directories for persistence:
-
-- `./models` -> `/app/models`
-- `./projects` -> `/app/projects`
-- `./checkpoints` -> `/app/checkpoints`
-- `./dataset_cache` -> `/app/dataset_cache`
-- `./tile_cache` -> `/app/tile_cache`
+The compose setup mounts `./data` → `/app/data` for persistence. This is the same directory used by local runs, so projects and checkpoints are shared between both modes.
 
 ## Remote GPU (SSH tunnel)
 
@@ -163,15 +159,15 @@ docs/             Architecture docs, setup guide, changelog
 
 ## Runtime Directories (gitignored)
 
-These are created automatically on first run:
+All runtime data lives under `data/`. Subdirectories are created automatically on first run:
 
 | Directory | Contents |
 |-----------|----------|
-| `checkpoints/` | Saved model weights during training |
-| `dataset_cache/` | Preprocessed tile datasets |
-| `tile_cache/` | Cached inference output tiles |
-| `projects/` | GeoPackage label stores and captured images |
-| `models/` | Model weight files (download separately) |
+| `data/models/` | Model weight files (download separately) |
+| `data/projects/` | GeoPackage label stores and captured images |
+| `data/checkpoints/` | Saved model weights during training |
+| `data/dataset_cache/` | Preprocessed tile datasets |
+| `data/tile_cache/` | Cached inference output tiles |
 
 ## License
 

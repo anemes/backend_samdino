@@ -17,11 +17,7 @@ services:
       - "7860:7860"
     volumes:
       - ./config/default.docker.cpu.yaml:/app/config/default.yaml:ro
-      - ./models:/app/models
-      - ./projects:/app/projects
-      - ./checkpoints:/app/checkpoints
-      - ./dataset_cache:/app/dataset_cache
-      - ./tile_cache:/app/tile_cache
+      - ./data:/app/data
     command: ["uvicorn", "hitl.app:app", "--host", "0.0.0.0", "--port", "8000"]
 
   backend-gpu:
@@ -40,11 +36,7 @@ services:
       - "7860:7860"
     volumes:
       - ./config/default.docker.gpu.yaml:/app/config/default.yaml:ro
-      - ./models:/app/models
-      - ./projects:/app/projects
-      - ./checkpoints:/app/checkpoints
-      - ./dataset_cache:/app/dataset_cache
-      - ./tile_cache:/app/tile_cache
+      - ./data:/app/data
     command: ["uvicorn", "hitl.app:app", "--host", "0.0.0.0", "--port", "8000"]
     gpus:
       - driver: nvidia

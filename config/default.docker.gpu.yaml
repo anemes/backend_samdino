@@ -1,7 +1,7 @@
 # Docker config (GPU profile)
 models:
   dinov3:
-    path: "/app/models/dinov3-vitl16-pretrain-sat493m"
+    path: "/app/data/models/dinov3-vitl16-pretrain-sat493m"
     patch_size: 16
     num_register_tokens: 4
     hidden_size: 1024
@@ -11,7 +11,7 @@ models:
     norm_std: [0.213, 0.156, 0.143]
 
   sam3:
-    checkpoint: "/app/models/sam3/sam3.pt"
+    checkpoint: "/app/data/models/sam3/sam3.pt"
     bpe_path: null
     resolution: 1008
     confidence_threshold: 0.5
@@ -57,10 +57,10 @@ inference:
   vector_simplify_tolerance: 1.0
 
 paths:
-  project_dir: "/app/projects"
-  checkpoint_dir: "/app/checkpoints"
-  dataset_cache_dir: "/app/dataset_cache"
-  tile_cache_dir: "/app/tile_cache"
+  project_dir: "/app/data/projects"
+  checkpoint_dir: "/app/data/checkpoints"
+  dataset_cache_dir: "/app/data/dataset_cache"
+  tile_cache_dir: "/app/data/tile_cache"
 
 server:
   host: "0.0.0.0"

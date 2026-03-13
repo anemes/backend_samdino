@@ -33,7 +33,7 @@ MODELS = {
     },
 }
 
-DEFAULT_MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
+DEFAULT_MODELS_DIR = Path(__file__).resolve().parent.parent / "data" / "models"
 
 
 def _has_nonempty_file(path: Path) -> bool:

@@ -97,10 +97,10 @@ Then configure the QGIS plugin to connect to `http://localhost:8000`.
 
 ### 1. Prepare model files
 
-Create a `models/` directory in `backend_samdino` and place:
+Create a `data/models/` directory in `backend_samdino` and place:
 
-- `models/dinov3-vitl16-pretrain-sat493m/...` (DINOv3 weights)
-- `models/sam3/sam3.pt` (SAM3 checkpoint)
+- `data/models/dinov3-vitl16-pretrain-sat493m/...` (DINOv3 weights)
+- `data/models/sam3/sam3.pt` (SAM3 checkpoint)
 
 ### 2. Start with Docker Compose
 
