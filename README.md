@@ -1,34 +1,49 @@
 # HITL Segmentation Backend
 
-FastAPI backend for human-in-the-loop semantic segmentation of geospatial imagery.
+Backend server for human-in-the-loop semantic segmentation. This repo acts as a server that offers some cool features:
+
+- A project-based API that allows multiple projects with their own classes, datasets and checkpoints
+- A SAM3 labelling API that accepts images and +/- coordinates to quickly label segmentations for curating a training dataset
+- A DinoV3 segmentation training API that can train new checkpoints for a project based on datasets attached to a project
+- A DinoV3 segmentation inference API that provides inferences
+- A dashboard for kicking off training runs, viewing training outputs, and performing batch inference
+
+Currently this has a nice [demo frontend client](https://github.com/anemes/qgis_sam3plugin) in the form of a QGIS plugin that can be used to rapidly build out geospatial segmentation models.
+
+The DinoV3 backbone is currently [DINOv3-sat ViT-L backbone](https://huggingface.co/facebook/dinov3-vit7b16-pretrain-sat493m) but easy to switch out.
 
 **Stack**: DINOv3-sat ViT-L backbone + UperNet head, SAM3 interactive labeling, GeoPackage label store, Gradio training dashboard.
 
 ## Requirements
 
 - Python 3.11+
+- [uv](https://docs.astral.sh/uv/) (Python package manager)
 - CUDA-capable GPU with 16+ GB VRAM (tested on RTX 3090 Ti 24 GB)
 - Git (for submodules)
 
 ## Install
+
+SAM3 is vendored as a git submodule at `vendor/sam3` and declared as a
+[uv path source](https://docs.astral.sh/uv/concepts/dependencies/#path-dependencies)
+in `pyproject.toml` (`[tool.uv.sources]`), so `uv sync` installs it automatically.
 
 ```bash
 # 1. Clone with submodules
 git clone --recurse-submodules <repo-url>
 cd hitl-seg-backend
 
-# 2. Create virtual environment
-python -m venv .venv
-source .venv/bin/activate
+# 2. Install all dependencies (creates .venv, installs SAM3 from vendor/sam3)
+uv sync
 
-# 3. Install PyTorch with CUDA
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# 3. (GPU only) Replace CPU PyTorch with CUDA wheels
+uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+```
 
-# 4. Install SAM3 from vendored submodule
-pip install -e vendor/sam3
+If you already cloned without `--recurse-submodules`, init the submodule first:
 
-# 5. Install backend
-pip install -e .
+```bash
+git submodule update --init --recursive
+uv sync
 ```
 
 ## Configure
@@ -61,6 +76,14 @@ python -m hitl.app
   - `./models/dinov3-vitl16-pretrain-sat493m/...`
   - `./models/sam3/sam3.pt`
 - Docker image dependencies are installed with `uv sync --frozen` from `uv.lock`
+
+### First-time setup
+
+Create the data directories before the first build so Docker doesn't create them as root:
+
+```bash
+mkdir -p models projects checkpoints dataset_cache tile_cache
+```
 
 ### CPU profile (Mac/Linux/Windows)
 
