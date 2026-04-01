@@ -15,7 +15,10 @@ def get_deps():
 @router.get("/list")
 def list_models(state=Depends(get_deps)):
     """List all saved checkpoints."""
-    return {"checkpoints": state.registry.list_checkpoints()}
+    return {
+        "checkpoints": state.registry.list_checkpoints(),
+        "production_run_id": state.registry.get_production_run(),
+    }
 
 
 @router.get("/best")

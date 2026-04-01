@@ -68,6 +68,7 @@ class InferenceService:
         class_names: List[str],
         checkpoint_path: Optional[str] = None,
         project_id: str = "default",
+        class_id_map: Optional[Dict[int, int]] = None,
     ) -> str:
         """Start inference in a background thread. Returns job_id."""
         if self.is_running:
@@ -78,7 +79,8 @@ class InferenceService:
 
         self._thread = threading.Thread(
             target=self._inference_loop,
-            args=(raster_source, aoi_bounds, num_classes, class_names, checkpoint_path, job_id),
+            args=(raster_source, aoi_bounds, num_classes, class_names,
+                  checkpoint_path, job_id, class_id_map or {}),
             daemon=True,
         )
         self._thread.start()
@@ -103,6 +105,7 @@ class InferenceService:
         class_names: List[str],
         checkpoint_path: Optional[str],
         job_id: str,
+        class_id_map: Dict[int, int] = None,
     ) -> None:
         """Main inference loop."""
         try:
@@ -170,6 +173,24 @@ class InferenceService:
 
             # Finalize
             class_map, confidence_map = stitcher.finalize()
+
+            # Remap checkpoint class indices → project class_ids
+            if class_id_map:
+                remapped = np.zeros_like(class_map)
+                for ckpt_idx, project_id in class_id_map.items():
+                    remapped[class_map == ckpt_idx] = project_id
+                # Keep background (1) and ignore (0) as-is
+                remapped[class_map == 0] = 0
+                remapped[class_map == 1] = 1
+                class_map = remapped
+                # Rebuild class_names indexed by max project class_id
+                max_id = max(class_id_map.values(), default=1)
+                project_names = ["ignore", "background"] + [""] * (max_id - 1)
+                for ckpt_idx, project_id in class_id_map.items():
+                    if ckpt_idx < len(class_names):
+                        project_names[project_id] = class_names[ckpt_idx]
+                class_names = project_names
+                logger.info("Remapped class indices: %s", class_id_map)
 
             # Export
             output_dir = Path(self.config.paths.project_dir) / "predictions"

@@ -126,6 +126,11 @@ def get_annotations(
 
 @router.post("/annotations")
 def add_annotation(req: AnnotationRequest, store=Depends(get_label_store)):
+    if req.class_id < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="class_id must be >= 2 (0=ignore, 1=background are implicit)",
+        )
     # Validate annotation is inside the target region
     if not store.check_annotation_in_region(
         req.geometry_geojson, req.region_id, crs=req.crs

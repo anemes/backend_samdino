@@ -84,7 +84,7 @@ server:
 gpu:
   device: "cuda"
   # Max VRAM to use (GB) - leave headroom for system
-  max_vram_gb: 22
+  max_vram_gb: 20
   # Extra VRAM reserved for training batches and gradients.
   # When max_vram_gb is large enough to fit SAM3 + segmentor + this overhead,
   # both models stay loaded simultaneously (no eviction on switch).

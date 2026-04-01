@@ -168,6 +168,12 @@ def accept_mask(
     if polygon is None:
         raise HTTPException(status_code=400, detail="No valid mask to accept")
 
+    if req.class_id < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="class_id must be >= 2 (0=ignore, 1=background are implicit)",
+        )
+
     # Validate annotation is inside the target region
     if not store.check_annotation_in_region(polygon, req.region_id, crs=req.crs):
         raise HTTPException(

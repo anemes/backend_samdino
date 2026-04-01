@@ -6,11 +6,13 @@ import json
 import logging
 import shutil
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+
+from ..data.label_store import SegClass
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,84 @@ def get_deps():
     return app_state
 
 
+def _resolve_checkpoint_classes(
+    checkpoint_record: Optional[dict],
+    user_classes: list,
+    store,
+) -> Tuple[int, List[str], Dict[int, int], List[str]]:
+    """Match checkpoint classes to project classes by name.
+
+    Returns:
+        ckpt_num_classes: num_classes to build the model with (from checkpoint)
+        ckpt_class_names: class name list for the checkpoint model
+        class_id_map: checkpoint class index → project class_id
+        warnings: list of warning messages
+    """
+    warnings: List[str] = []
+
+    if not checkpoint_record:
+        # No checkpoint — use project classes directly, no remapping
+        project_num = store.get_num_classes()
+        project_map = {c.class_id: c.name for c in user_classes}
+        names = ["ignore", "background"]
+        for i in range(2, project_num):
+            names.append(project_map.get(i, f"class_{i}"))
+        return project_num, names, {}, warnings
+
+    ckpt_class_names = checkpoint_record.get("class_names", [])
+    ckpt_num_classes = checkpoint_record.get("num_classes", 0)
+
+    if not ckpt_class_names or ckpt_num_classes < 2:
+        # Legacy checkpoint without class metadata — fall back to project
+        project_num = store.get_num_classes()
+        project_map = {c.class_id: c.name for c in user_classes}
+        names = ["ignore", "background"]
+        for i in range(2, project_num):
+            names.append(project_map.get(i, f"class_{i}"))
+        warnings.append("Checkpoint has no class metadata — using project classes (may mismatch)")
+        return project_num, names, {}, warnings
+
+    # Build name → project class_id lookup
+    project_class_map = {c.name: c.class_id for c in user_classes}
+    existing_names = {c.name for c in user_classes}
+
+    # Auto-add checkpoint classes missing from project
+    added = []
+    for ckpt_idx in range(2, ckpt_num_classes):
+        ckpt_name = ckpt_class_names[ckpt_idx] if ckpt_idx < len(ckpt_class_names) else None
+        if ckpt_name and ckpt_name not in existing_names:
+            new_id = max((c.class_id for c in user_classes), default=1) + 1 + len(added)
+            user_classes.append(SegClass(class_id=new_id, name=ckpt_name, color="#888888"))
+            added.append(ckpt_name)
+
+    if added:
+        store.set_classes(user_classes)
+        warnings.append(f"Added checkpoint classes to project: {', '.join(added)}")
+        # Rebuild lookup after additions
+        project_class_map = {c.name: c.class_id for c in user_classes}
+
+    # Map checkpoint indices → project class_ids by name
+    class_id_map: Dict[int, int] = {}
+    for ckpt_idx in range(2, ckpt_num_classes):
+        ckpt_name = ckpt_class_names[ckpt_idx] if ckpt_idx < len(ckpt_class_names) else None
+        if ckpt_name and ckpt_name in project_class_map:
+            project_id = project_class_map[ckpt_name]
+            class_id_map[ckpt_idx] = project_id
+            if ckpt_idx != project_id:
+                warnings.append(
+                    f"Class '{ckpt_name}': checkpoint index {ckpt_idx} "
+                    f"!= project class_id {project_id} (remapped)"
+                )
+
+    # Warn about project classes missing from checkpoint
+    ckpt_user_names = set(ckpt_class_names[2:ckpt_num_classes])
+    for cls in user_classes:
+        if cls.name not in ckpt_user_names:
+            warnings.append(f"Project class '{cls.name}' not in checkpoint — won't be predicted")
+
+    return ckpt_num_classes, ckpt_class_names, class_id_map, warnings
+
+
 @router.post("/predict")
 def start_prediction(req: PredictRequest, state=Depends(get_deps)):
     """Start tiled inference on an AOI."""
@@ -51,15 +131,11 @@ def start_prediction(req: PredictRequest, state=Depends(get_deps)):
         raster_source = GeoTIFFSource(req.raster_path)
     else:
         raise HTTPException(status_code=400, detail="Provide raster_path or xyz_url")
-    num_classes = state.label_store.get_num_classes()
-    # Build class_names list indexed by class_id: [ignore, background, cls2, cls3, ...]
-    user_classes = state.label_store.get_classes()
-    class_names = ["ignore", "background"]
-    class_map = {c.class_id: c.name for c in user_classes}
-    for i in range(2, num_classes):
-        class_names.append(class_map.get(i, f"class_{i}"))
+
+    user_classes = list(state.label_store.get_classes())
 
     # Resolve checkpoint
+    checkpoint_record = None
     checkpoint_path = None
     if req.checkpoint_run_id:
         checkpoint_path = state.registry.get_checkpoint_path(
@@ -68,10 +144,20 @@ def start_prediction(req: PredictRequest, state=Depends(get_deps)):
         if checkpoint_path is None:
             raise HTTPException(status_code=404, detail="Checkpoint not found")
         checkpoint_path = str(checkpoint_path)
+        # Find matching record for metadata
+        for rec in state.registry.list_checkpoints():
+            if rec.get("checkpoint_path") == checkpoint_path:
+                checkpoint_record = rec
+                break
     else:
-        best = state.registry.get_best_checkpoint()
-        if best:
-            checkpoint_path = best.get("checkpoint_path")
+        checkpoint_record = state.registry.get_best_checkpoint()
+        if checkpoint_record:
+            checkpoint_path = checkpoint_record.get("checkpoint_path")
+
+    # Match checkpoint classes to project classes
+    num_classes, class_names, class_id_map, warnings = _resolve_checkpoint_classes(
+        checkpoint_record, user_classes, state.label_store,
+    )
 
     job_id = state.inference_service.start_inference(
         raster_source=raster_source,
@@ -80,8 +166,9 @@ def start_prediction(req: PredictRequest, state=Depends(get_deps)):
         class_names=class_names,
         checkpoint_path=checkpoint_path,
         project_id=req.project_id,
+        class_id_map=class_id_map,
     )
-    return {"job_id": job_id, "status": "started"}
+    return {"job_id": job_id, "status": "started", "warnings": warnings}
 
 
 @router.post("/predict-upload")
@@ -121,15 +208,10 @@ async def start_prediction_upload(
 
     raster_source = GeoTIFFSource(str(upload_path))
 
-    # Resolve classes
-    num_classes = state.label_store.get_num_classes()
-    user_classes = state.label_store.get_classes()
-    class_names = ["ignore", "background"]
-    class_map = {c.class_id: c.name for c in user_classes}
-    for i in range(2, num_classes):
-        class_names.append(class_map.get(i, f"class_{i}"))
+    user_classes = list(state.label_store.get_classes())
 
     # Resolve checkpoint
+    checkpoint_record = None
     checkpoint_path = None
     if checkpoint_run_id:
         checkpoint_path = state.registry.get_checkpoint_path(
@@ -138,10 +220,19 @@ async def start_prediction_upload(
         if checkpoint_path is None:
             raise HTTPException(status_code=404, detail="Checkpoint not found")
         checkpoint_path = str(checkpoint_path)
+        for rec in state.registry.list_checkpoints():
+            if rec.get("checkpoint_path") == checkpoint_path:
+                checkpoint_record = rec
+                break
     else:
-        best = state.registry.get_best_checkpoint()
-        if best:
-            checkpoint_path = best.get("checkpoint_path")
+        checkpoint_record = state.registry.get_best_checkpoint()
+        if checkpoint_record:
+            checkpoint_path = checkpoint_record.get("checkpoint_path")
+
+    # Match checkpoint classes to project classes
+    num_classes, class_names, class_id_map, warnings = _resolve_checkpoint_classes(
+        checkpoint_record, user_classes, state.label_store,
+    )
 
     job_id = state.inference_service.start_inference(
         raster_source=raster_source,
@@ -150,8 +241,9 @@ async def start_prediction_upload(
         class_names=class_names,
         checkpoint_path=checkpoint_path,
         project_id=project_id,
+        class_id_map=class_id_map,
     )
-    return {"job_id": job_id, "status": "started"}
+    return {"job_id": job_id, "status": "started", "warnings": warnings}
 
 
 @router.get("/status")

@@ -144,3 +144,56 @@ class ModelRegistry:
         """Get path to a specific checkpoint."""
         p = self.root / f"run_{run_id}" / f"{which}.pt"
         return p if p.exists() else None
+
+    def list_runs(self) -> List[str]:
+        """List distinct run_ids that have checkpoints."""
+        records = self._load_json(self._registry_path)
+        seen = set()
+        runs = []
+        for r in records:
+            rid = r.get("run_id")
+            if rid and rid not in seen:
+                seen.add(rid)
+                runs.append(rid)
+        return runs
+
+    def delete_run(self, run_id: str) -> bool:
+        """Delete a run's checkpoint directory and registry/metrics entries."""
+        run_dir = self.root / f"run_{run_id}"
+        if run_dir.exists():
+            shutil.rmtree(run_dir)
+
+        records = self._load_json(self._registry_path)
+        records = [r for r in records if r.get("run_id") != run_id]
+        self._save_json(self._registry_path, records)
+
+        metrics = self._load_json(self._metrics_path)
+        metrics = [m for m in metrics if m.get("run_id") != run_id]
+        self._save_json(self._metrics_path, metrics)
+
+        if self.get_production_run() == run_id:
+            self.clear_production_run()
+
+        return True
+
+    def get_production_run(self) -> Optional[str]:
+        """Return the run_id marked as production, or None."""
+        prod_path = self.root / "production.json"
+        if prod_path.exists():
+            data = json.loads(prod_path.read_text())
+            return data.get("run_id")
+        return None
+
+    def set_production_run(self, run_id: str) -> None:
+        """Promote a run to production for this project."""
+        run_dir = self.root / f"run_{run_id}"
+        if not run_dir.exists():
+            raise ValueError(f"Run '{run_id}' not found")
+        data = {"run_id": run_id, "promoted_at": datetime.now().isoformat()}
+        (self.root / "production.json").write_text(json.dumps(data, indent=2))
+
+    def clear_production_run(self) -> None:
+        """Remove production designation."""
+        prod_path = self.root / "production.json"
+        if prod_path.exists():
+            prod_path.unlink()

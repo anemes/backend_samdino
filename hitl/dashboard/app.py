@@ -230,154 +230,45 @@ def create_dashboard():
 
     # --- Model helpers ---
 
-    def list_all_models():
-        """List checkpoints across all projects, show class schema info."""
+    def get_runs_for_project(project_id):
+        """Return list of (label, value) tuples for runs in a project."""
         state = _get_state()
-        if not state or not state.project_manager:
-            return "No backend"
-
+        if not state or not project_id:
+            return []
         from ..models.registry import ModelRegistry
-
-        pm = state.project_manager
         ckpt_dir = Path(state.config.paths.checkpoint_dir)
+        proj_ckpt_dir = ckpt_dir / project_id
+        if not proj_ckpt_dir.exists():
+            return []
+        reg = ModelRegistry(ckpt_dir, project_id)
+        runs = reg.list_runs()
+        prod = reg.get_production_run()
+        return [(f"{r} [PRODUCTION]" if r == prod else r, r) for r in runs]
 
-        lines = []
-        for proj in pm.list_projects():
-            proj_ckpt_dir = ckpt_dir / proj.project_id
-            registry_path = proj_ckpt_dir / "registry.json"
-            if not registry_path.exists():
-                continue
-
-            reg = ModelRegistry(ckpt_dir, proj.project_id)
-            checkpoints = reg.list_checkpoints()
-            best = [c for c in checkpoints if "best" in c.get("checkpoint_path", "")]
-
-            if not best:
-                continue
-
-            # Group by run_id, keep best per run
-            runs = {}
-            for c in best:
-                rid = c.get("run_id", "?")
-                if rid not in runs or c.get("best_val_mIoU", 0) > runs[rid].get("best_val_mIoU", 0):
-                    runs[rid] = c
-
-            lines.append(f"=== Project: {proj.name} ({proj.project_id}) ===")
-            for rid, c in runs.items():
-                classes = c.get("class_names", [])
-                classes_str = ", ".join(classes[2:]) if len(classes) > 2 else "none"
-                lines.append(
-                    f"  Run: {rid}\n"
-                    f"    mIoU: {c.get('best_val_mIoU', 0):.4f}\n"
-                    f"    Classes ({c.get('num_classes', 0)}): {classes_str}\n"
-                    f"    Path: {c.get('checkpoint_path', '?')}\n"
-                    f"    Time: {c.get('timestamp', '?')}"
-                )
-            lines.append("")
-
-        return "\n".join(lines) if lines else "No trained models yet"
-
-    def get_run_metrics(run_id):
-        """Get detailed metrics for a specific run."""
-        state = _get_state()
-        if not state:
-            return "No backend", None, None
-
-        # Search across all project registries
-        from ..models.registry import ModelRegistry
-
-        pm = state.project_manager
-        ckpt_dir = Path(state.config.paths.checkpoint_dir)
-        metrics = []
-
-        if pm:
-            for proj in pm.list_projects():
-                reg = ModelRegistry(ckpt_dir, proj.project_id)
-                m = reg.get_metrics(run_id=run_id)
-                if m:
-                    metrics = m
-                    break
-
-        if not metrics:
-            # Try current project's registry
-            metrics = state.registry.get_metrics(run_id=run_id)
-
-        if not metrics:
-            return f"No metrics for run '{run_id}'", None, None
-
-        # Summary
-        best_epoch = max(metrics, key=lambda m: m.get("val_mIoU", 0))
-        summary = (
-            f"Run: {run_id}\n"
-            f"Epochs trained: {len(metrics)}\n"
-            f"Best epoch: {best_epoch.get('epoch', '?')}\n"
-            f"Best val mIoU: {best_epoch.get('val_mIoU', 0):.4f}\n"
-            f"Final train loss: {metrics[-1].get('train_loss', 0):.4f}\n"
-            f"Final val loss: {metrics[-1].get('val_loss', 0):.4f}\n"
-            f"Train tiles: {best_epoch.get('num_train_tiles', 0)}\n"
-            f"Val tiles: {best_epoch.get('num_val_tiles', 0)}\n"
-            f"Num classes: {best_epoch.get('num_classes', 0)}"
-        )
-
-        # Per-class IoU at best epoch
-        per_class = best_epoch.get("per_class_iou", {})
-        if per_class:
-            summary += "\n\nPer-class IoU (best epoch):\n"
-            for name, iou in sorted(per_class.items(), key=lambda x: -float(x[1])):
-                bar = "#" * int(float(iou) * 30)
-                summary += f"  {name:<20} {float(iou):>7.4f}  {bar}\n"
-
-        # Build plot data
-        loss_data = None
-        miou_data = None
-        try:
-            import pandas as pd
-
-            df = pd.DataFrame(metrics)
-            if "epoch" in df.columns:
-                loss_data = df[["epoch", "train_loss", "val_loss"]].melt(
-                    id_vars="epoch",
-                    value_vars=["train_loss", "val_loss"],
-                    var_name="type", value_name="loss"
-                )
-                miou_data = df[["epoch", "val_mIoU"]].copy()
-        except ImportError:
-            pass
-
-        return summary, loss_data, miou_data
-
-    def check_model_compatibility(run_id):
+    def _build_compatibility_report(project_id, run_id):
         """Check which projects a model's class schema is compatible with."""
         state = _get_state()
         if not state or not state.project_manager:
-            return "No backend"
+            return ""
 
         from ..models.registry import ModelRegistry
-
-        # Find the model's class schema from any project registry
         pm = state.project_manager
         ckpt_dir = Path(state.config.paths.checkpoint_dir)
-        model_classes = None
 
-        for proj in pm.list_projects():
-            reg = ModelRegistry(ckpt_dir, proj.project_id)
-            checkpoints = reg.list_checkpoints()
-            for c in checkpoints:
-                if c.get("run_id") == run_id:
-                    model_classes = c.get("class_names", [])
-                    break
-            if model_classes:
+        reg = ModelRegistry(ckpt_dir, project_id)
+        checkpoints = reg.list_checkpoints()
+        model_classes = None
+        for c in checkpoints:
+            if c.get("run_id") == run_id:
+                model_classes = c.get("class_names", [])
                 break
 
         if not model_classes:
-            return f"Run '{run_id}' not found in any project registry"
+            return f"Run '{run_id}' not found in registry"
 
-        # Check each project
         lines = [
-            f"Model class schema: {model_classes}",
-            f"Num classes: {len(model_classes)}",
+            f"Model classes: {', '.join(model_classes[2:])} ({len(model_classes)} total)",
             "",
-            "Compatibility:",
         ]
 
         from ..data.label_store import LabelStore
@@ -402,10 +293,98 @@ def create_dashboard():
             else:
                 lines.append(
                     f"  {proj.name}: INCOMPATIBLE "
-                    f"(model has {len(model_classes)} classes, project has {len(proj_class_names)})"
+                    f"(model has {len(model_classes)}, project has {len(proj_class_names)})"
                 )
 
         return "\n".join(lines)
+
+    def get_run_details(project_id, run_id):
+        """Get metrics + compatibility for a run. Returns (summary, loss_data, miou_data, compat)."""
+        state = _get_state()
+        if not state or not project_id or not run_id:
+            return "Select a project and run", None, None, ""
+
+        from ..models.registry import ModelRegistry
+        ckpt_dir = Path(state.config.paths.checkpoint_dir)
+        reg = ModelRegistry(ckpt_dir, project_id)
+        metrics = reg.get_metrics(run_id=run_id)
+
+        if not metrics:
+            return f"No metrics for run '{run_id}'", None, None, ""
+
+        best_epoch = max(metrics, key=lambda m: m.get("val_mIoU", 0))
+        prod = reg.get_production_run()
+        prod_label = "  ** PRODUCTION **" if run_id == prod else ""
+        summary = (
+            f"Run: {run_id}{prod_label}\n"
+            f"Epochs trained: {len(metrics)}\n"
+            f"Best epoch: {best_epoch.get('epoch', '?')}\n"
+            f"Best val mIoU: {best_epoch.get('val_mIoU', 0):.4f}\n"
+            f"Final train loss: {metrics[-1].get('train_loss', 0):.4f}\n"
+            f"Final val loss: {metrics[-1].get('val_loss', 0):.4f}\n"
+            f"Train tiles: {best_epoch.get('num_train_tiles', 0)}\n"
+            f"Val tiles: {best_epoch.get('num_val_tiles', 0)}\n"
+            f"Num classes: {best_epoch.get('num_classes', 0)}"
+        )
+
+        per_class = best_epoch.get("per_class_iou", {})
+        if per_class:
+            summary += "\n\nPer-class IoU (best epoch):\n"
+            for name, iou in sorted(per_class.items(), key=lambda x: -float(x[1])):
+                bar = "#" * int(float(iou) * 30)
+                summary += f"  {name:<20} {float(iou):>7.4f}  {bar}\n"
+
+        loss_data = None
+        miou_data = None
+        try:
+            import pandas as pd
+            df = pd.DataFrame(metrics)
+            if "epoch" in df.columns:
+                loss_data = df[["epoch", "train_loss", "val_loss"]].melt(
+                    id_vars="epoch",
+                    value_vars=["train_loss", "val_loss"],
+                    var_name="type", value_name="loss"
+                )
+                miou_data = df[["epoch", "val_mIoU"]].copy()
+        except ImportError:
+            pass
+
+        compat = _build_compatibility_report(project_id, run_id)
+        return summary, loss_data, miou_data, compat
+
+    def delete_run_handler(project_id, run_id, confirmed):
+        """Delete a run's checkpoint and return updated run list."""
+        if not confirmed:
+            return gr.update(), "Check 'Confirm deletion' first", None, None, ""
+        if not project_id or not run_id:
+            return gr.update(), "Select a project and run", None, None, ""
+
+        from ..models.registry import ModelRegistry
+        s = _get_state()
+        ckpt_dir = Path(s.config.paths.checkpoint_dir)
+        reg = ModelRegistry(ckpt_dir, project_id)
+        reg.delete_run(run_id)
+
+        new_runs = get_runs_for_project(project_id)
+        return (
+            gr.update(choices=new_runs, value=None),
+            f"Deleted run '{run_id}'",
+            None, None, "",
+        )
+
+    def promote_run_handler(project_id, run_id):
+        """Promote a run to production (recommended model label)."""
+        if not project_id or not run_id:
+            return gr.update(), "Select a project and run"
+
+        from ..models.registry import ModelRegistry
+        s = _get_state()
+        ckpt_dir = Path(s.config.paths.checkpoint_dir)
+        reg = ModelRegistry(ckpt_dir, project_id)
+        reg.set_production_run(run_id)
+
+        new_runs = get_runs_for_project(project_id)
+        return gr.update(choices=new_runs, value=run_id), f"Promoted '{run_id}' to production"
 
     # --- Dataset helpers ---
 
@@ -597,60 +576,90 @@ def create_dashboard():
         # ==================== MODELS TAB ====================
         with gr.Tab("Models"):
             with gr.Row():
-                with gr.Column():
-                    gr.Markdown("### All Trained Models")
-                    models_box = gr.Textbox(
-                        label="Checkpoints by Project", lines=20,
-                        interactive=False, elem_classes=["mono"],
-                    )
-                    models_refresh = gr.Button("Refresh Models")
-                    models_refresh.click(list_all_models, outputs=[models_box])
+                # Left column: selectors & actions
+                with gr.Column(scale=1):
+                    gr.Markdown("### Model Explorer")
 
-                with gr.Column():
-                    gr.Markdown("### Run Details")
-                    run_id_input = gr.Textbox(
-                        label="Run ID",
-                        placeholder="project_abc12345",
+                    model_project = gr.Dropdown(
+                        label="Project",
+                        choices=get_project_list(),
+                        value=None,
                     )
-                    run_detail_btn = gr.Button("Load Run Metrics")
+                    model_refresh_proj = gr.Button("Refresh Projects", size="sm")
+
+                    run_selector = gr.Dropdown(
+                        label="Run",
+                        choices=[],
+                        value=None,
+                    )
+
+                    with gr.Row():
+                        promote_btn = gr.Button(
+                            "Promote to Production", variant="primary",
+                        )
+                        delete_btn = gr.Button("Delete Run", variant="stop")
+
+                    delete_confirm = gr.Checkbox(
+                        label="Confirm deletion", value=False,
+                    )
+
+                # Right column: run details
+                with gr.Column(scale=2):
+                    gr.Markdown("### Run Details")
 
                     run_summary = gr.Textbox(
-                        label="Summary", lines=15, interactive=False,
+                        label="Summary", lines=12, interactive=False,
                         elem_classes=["mono"],
                     )
-                    run_loss_plot = gr.LinePlot(
-                        x="epoch", y="loss", color="type",
-                        title="Loss Curves",
-                        height=250,
-                    )
-                    run_miou_plot = gr.LinePlot(
-                        x="epoch", y="val_mIoU",
-                        title="Validation mIoU",
-                        height=250,
+                    with gr.Row():
+                        run_loss_plot = gr.LinePlot(
+                            x="epoch", y="loss", color="type",
+                            title="Loss Curves",
+                            height=250,
+                        )
+                        run_miou_plot = gr.LinePlot(
+                            x="epoch", y="val_mIoU",
+                            title="Validation mIoU",
+                            height=250,
+                        )
+
+                    gr.Markdown("### Compatibility Report")
+                    compat_report = gr.Textbox(
+                        label="Cross-project compatibility", lines=8,
+                        interactive=False, elem_classes=["mono"],
                     )
 
-                    run_detail_btn.click(
-                        get_run_metrics,
-                        inputs=[run_id_input],
-                        outputs=[run_summary, run_loss_plot, run_miou_plot],
-                    )
-
-            gr.Markdown("### Model Compatibility Check")
-            with gr.Row():
-                compat_run_id = gr.Textbox(
-                    label="Run ID to check",
-                    placeholder="Enter run_id",
-                )
-                compat_btn = gr.Button("Check Compatibility")
-
-            compat_result = gr.Textbox(
-                label="Compatibility Report", lines=10, interactive=False,
-                elem_classes=["mono"],
+            # --- Event wiring ---
+            model_refresh_proj.click(
+                lambda: gr.update(choices=get_project_list()),
+                outputs=[model_project],
             )
-            compat_btn.click(
-                check_model_compatibility,
-                inputs=[compat_run_id],
-                outputs=[compat_result],
+
+            model_project.change(
+                lambda pid: gr.update(choices=get_runs_for_project(pid), value=None),
+                inputs=[model_project],
+                outputs=[run_selector],
+            )
+
+            run_selector.change(
+                get_run_details,
+                inputs=[model_project, run_selector],
+                outputs=[run_summary, run_loss_plot, run_miou_plot, compat_report],
+            )
+
+            promote_btn.click(
+                promote_run_handler,
+                inputs=[model_project, run_selector],
+                outputs=[run_selector, run_summary],
+            )
+
+            delete_btn.click(
+                delete_run_handler,
+                inputs=[model_project, run_selector, delete_confirm],
+                outputs=[
+                    run_selector,
+                    run_summary, run_loss_plot, run_miou_plot, compat_report,
+                ],
             )
 
         # ==================== DATASET TAB ====================
