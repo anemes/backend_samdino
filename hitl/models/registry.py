@@ -28,6 +28,7 @@ class RunMetrics:
     num_val_tiles: int = 0
     num_classes: int = 0
     training_time_s: float = 0.0
+    learning_rate: float = 0.0
     timestamp: str = ""
 
     def __post_init__(self):

@@ -9,6 +9,7 @@ Tabs:
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -190,23 +191,25 @@ def create_dashboard():
             f"Run: {ts['run_id']}\n"
             f"Epoch: {ts['epoch']}/{ts['total_epochs']}\n"
             f"Progress: {ts['progress_pct']:.1f}%\n"
-            f"Train Loss: {ts['train_loss']:.4f}\n"
-            f"Val Loss: {ts['val_loss']:.4f}\n"
-            f"Val mIoU: {ts['val_mIoU']:.4f}\n"
-            f"Best mIoU: {ts['best_val_mIoU']:.4f}"
+            f"Train Loss: {ts['train_loss']:.4f}  |  Train mIoU: {ts['train_mIoU']:.4f}\n"
+            f"Val Loss:   {ts['val_loss']:.4f}  |  Val mIoU:   {ts['val_mIoU']:.4f}\n"
+            f"Best mIoU: {ts['best_val_mIoU']:.4f}\n"
+            f"LR: {ts['learning_rate']:.2e}  |  Epoch time: {ts['epoch_time_s']:.1f}s"
         )
         if ts['error_message']:
             status += f"\nError: {ts['error_message']}"
 
-        # Per-class IoU from latest epoch
-        per_class = ts.get("per_class_iou", {})
+        # Per-class IoU + F1 from latest epoch
+        per_class_iou = ts.get("per_class_iou", {})
+        per_class_f1 = ts.get("per_class_f1", {})
         per_class_text = ""
-        if per_class:
-            lines = [f"{'Class':<20} {'IoU':>8}"]
-            lines.append("-" * 30)
-            for name, iou in sorted(per_class.items(), key=lambda x: -x[1]):
-                bar = "#" * int(iou * 30)
-                lines.append(f"{name:<20} {iou:>7.4f}  {bar}")
+        if per_class_iou:
+            lines = [f"{'Class':<20} {'IoU':>8} {'F1':>8}"]
+            lines.append("-" * 40)
+            for name, iou in sorted(per_class_iou.items(), key=lambda x: -x[1]):
+                f1 = per_class_f1.get(name, 0.0)
+                bar = "#" * int(iou * 25)
+                lines.append(f"{name:<20} {iou:>7.4f} {f1:>7.4f}  {bar}")
             per_class_text = "\n".join(lines)
 
         # Dataset info
@@ -315,24 +318,31 @@ def create_dashboard():
         best_epoch = max(metrics, key=lambda m: m.get("val_mIoU", 0))
         prod = reg.get_production_run()
         prod_label = "  ** PRODUCTION **" if run_id == prod else ""
+        total_time = sum(m.get("training_time_s", 0) for m in metrics)
         summary = (
             f"Run: {run_id}{prod_label}\n"
             f"Epochs trained: {len(metrics)}\n"
             f"Best epoch: {best_epoch.get('epoch', '?')}\n"
             f"Best val mIoU: {best_epoch.get('val_mIoU', 0):.4f}\n"
+            f"Best train mIoU: {best_epoch.get('train_mIoU', 0):.4f}\n"
             f"Final train loss: {metrics[-1].get('train_loss', 0):.4f}\n"
             f"Final val loss: {metrics[-1].get('val_loss', 0):.4f}\n"
+            f"Final LR: {metrics[-1].get('learning_rate', 0):.2e}\n"
+            f"Total training time: {total_time:.0f}s ({total_time/60:.1f}min)\n"
             f"Train tiles: {best_epoch.get('num_train_tiles', 0)}\n"
             f"Val tiles: {best_epoch.get('num_val_tiles', 0)}\n"
             f"Num classes: {best_epoch.get('num_classes', 0)}"
         )
 
-        per_class = best_epoch.get("per_class_iou", {})
-        if per_class:
-            summary += "\n\nPer-class IoU (best epoch):\n"
-            for name, iou in sorted(per_class.items(), key=lambda x: -float(x[1])):
-                bar = "#" * int(float(iou) * 30)
-                summary += f"  {name:<20} {float(iou):>7.4f}  {bar}\n"
+        per_class_iou = best_epoch.get("per_class_iou", {})
+        per_class_f1 = best_epoch.get("per_class_f1", {})
+        if per_class_iou:
+            summary += f"\n\n{'Class':<20} {'IoU':>8} {'F1':>8}\n"
+            summary += "-" * 40 + "\n"
+            for name, iou in sorted(per_class_iou.items(), key=lambda x: -float(x[1])):
+                f1 = per_class_f1.get(name, 0.0)
+                bar = "#" * int(float(iou) * 25)
+                summary += f"  {name:<20} {float(iou):>7.4f} {float(f1):>7.4f}  {bar}\n"
 
         loss_data = None
         miou_data = None
@@ -345,7 +355,11 @@ def create_dashboard():
                     value_vars=["train_loss", "val_loss"],
                     var_name="type", value_name="loss"
                 )
-                miou_data = df[["epoch", "val_mIoU"]].copy()
+                miou_data = df[["epoch", "train_mIoU", "val_mIoU"]].melt(
+                    id_vars="epoch",
+                    value_vars=["train_mIoU", "val_mIoU"],
+                    var_name="type", value_name="mIoU"
+                )
         except ImportError:
             pass
 
@@ -448,6 +462,104 @@ def create_dashboard():
         except Exception as e:
             return f"Error: {e}"
 
+    # --- Inference results helpers ---
+
+    def _predictions_dir():
+        state = _get_state()
+        if not state:
+            return None
+        return Path(state.config.paths.project_dir) / "predictions"
+
+    def list_inference_choices():
+        """Return (label, value) tuples for inference job dropdown."""
+        pdir = _predictions_dir()
+        if not pdir or not pdir.exists():
+            return []
+        manifests = sorted(pdir.glob("*_manifest.json"), reverse=True)
+        choices = []
+        for m in manifests:
+            data = json.loads(m.read_text())
+            job_id = data["job_id"]
+            ts = data.get("timestamp", "?")[:19]
+            tiles = data.get("tiles_processed", 0)
+            choices.append((f"{job_id} ({ts}, {tiles} tiles)", job_id))
+        return choices
+
+    def get_inference_details(job_id):
+        """Load manifest and return formatted details."""
+        pdir = _predictions_dir()
+        if not pdir or not job_id:
+            return "Select an inference job"
+        manifest_path = pdir / f"{job_id}_manifest.json"
+        if not manifest_path.exists():
+            return f"Manifest not found for {job_id}"
+        data = json.loads(manifest_path.read_text())
+        total_bytes = sum(
+            Path(p).stat().st_size for p in data.get("files", {}).values()
+            if Path(p).exists()
+        )
+        size_mb = total_bytes / 1024 / 1024
+        class_names = data.get("class_names", [])
+        lines = [
+            f"Job ID: {data['job_id']}",
+            f"Timestamp: {data.get('timestamp', '?')}",
+            f"AOI bounds: {data.get('aoi_bounds', '?')}",
+            f"CRS: {data.get('crs', '?')}",
+            f"Tiles processed: {data.get('tiles_processed', 0)}",
+            f"Classes: {', '.join(class_names[2:])} ({data.get('num_classes', 0)} total)",
+            f"Total size: {size_mb:.1f} MB",
+            "",
+            "Files:",
+        ]
+        for ftype, fpath in data.get("files", {}).items():
+            exists = Path(fpath).exists()
+            size = Path(fpath).stat().st_size / 1024 / 1024 if exists else 0
+            lines.append(f"  {ftype}: {Path(fpath).name} ({size:.1f} MB)" + ("" if exists else " [MISSING]"))
+        return "\n".join(lines)
+
+    def delete_inference_job(job_id, confirmed):
+        """Delete all files for a job and its manifest."""
+        if not confirmed:
+            return gr.update(), "Check 'Confirm deletion' first"
+        if not job_id:
+            return gr.update(), "Select a job first"
+        pdir = _predictions_dir()
+        if not pdir:
+            return gr.update(), "No predictions directory"
+        # Delete all files matching job_id
+        deleted = 0
+        for f in pdir.glob(f"{job_id}_*"):
+            f.unlink()
+            deleted += 1
+        new_choices = list_inference_choices()
+        return gr.update(choices=new_choices, value=None), f"Deleted {deleted} files for {job_id}"
+
+    # --- Disk usage helper ---
+
+    def get_disk_usage():
+        """Calculate disk usage for key directories."""
+        state = _get_state()
+        if not state:
+            return "No backend"
+        dirs = {
+            "Projects": state.config.paths.project_dir,
+            "Checkpoints": state.config.paths.checkpoint_dir,
+            "Dataset cache": state.config.paths.dataset_cache_dir,
+            "Tile cache": state.config.paths.tile_cache_dir,
+        }
+        lines = []
+        total_all = 0
+        for label, path in dirs.items():
+            p = Path(path)
+            if p.exists():
+                total = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+                total_all += total
+                lines.append(f"{label:<16} {total / 1024 / 1024:>8.1f} MB  ({path})")
+            else:
+                lines.append(f"{label:<16}      0 MB  ({path})")
+        lines.append(f"{'TOTAL':<16} {total_all / 1024 / 1024:>8.1f} MB")
+        return "\n".join(lines)
+
     # ========================== BUILD DASHBOARD ==========================
 
     with gr.Blocks(title="HITL Segmentation Dashboard") as demo:
@@ -470,10 +582,19 @@ def create_dashboard():
                         label="Project Info", value="--", lines=3, interactive=False
                     )
 
+            disk_usage_box = gr.Textbox(
+                label="Disk Usage", lines=6, interactive=False,
+                elem_classes=["mono"],
+            )
+
             status_refresh = gr.Button("Refresh Status", variant="secondary")
             status_refresh.click(
                 refresh_status,
                 outputs=[train_status_box, gpu_box, proj_box],
+            )
+            status_refresh.click(
+                get_disk_usage,
+                outputs=[disk_usage_box],
             )
 
         # ==================== TRAINING TAB ====================
@@ -552,7 +673,7 @@ def create_dashboard():
                     )
 
                     per_class_box = gr.Textbox(
-                        label="Per-Class IoU (current epoch)", lines=8,
+                        label="Per-Class IoU & F1 (current epoch)", lines=8,
                         interactive=False, elem_classes=["mono"],
                     )
 
@@ -618,8 +739,8 @@ def create_dashboard():
                             height=250,
                         )
                         run_miou_plot = gr.LinePlot(
-                            x="epoch", y="val_mIoU",
-                            title="Validation mIoU",
+                            x="epoch", y="mIoU", color="type",
+                            title="mIoU",
                             height=250,
                         )
 
@@ -741,6 +862,50 @@ def create_dashboard():
             )
             stats_load_btn.click(
                 get_label_stats, inputs=[stats_project], outputs=[label_stats_box]
+            )
+
+        # ==================== INFERENCE TAB ====================
+        with gr.Tab("Inference"):
+            gr.Markdown("### Inference Results")
+            gr.Markdown("Browse and manage saved inference predictions.")
+
+            with gr.Row():
+                with gr.Column(scale=1):
+                    infer_selector = gr.Dropdown(
+                        label="Inference Job",
+                        choices=list_inference_choices(),
+                        value=None,
+                    )
+                    infer_refresh_btn = gr.Button("Refresh", size="sm")
+
+                    with gr.Row():
+                        infer_delete_btn = gr.Button("Delete Job", variant="stop")
+                    infer_delete_confirm = gr.Checkbox(
+                        label="Confirm deletion", value=False,
+                    )
+
+                with gr.Column(scale=2):
+                    infer_details = gr.Textbox(
+                        label="Job Details", lines=12, interactive=False,
+                        elem_classes=["mono"],
+                    )
+
+            # --- Inference event wiring ---
+            infer_refresh_btn.click(
+                lambda: gr.update(choices=list_inference_choices()),
+                outputs=[infer_selector],
+            )
+
+            infer_selector.change(
+                get_inference_details,
+                inputs=[infer_selector],
+                outputs=[infer_details],
+            )
+
+            infer_delete_btn.click(
+                delete_inference_job,
+                inputs=[infer_selector, infer_delete_confirm],
+                outputs=[infer_selector, infer_details],
             )
 
     return demo

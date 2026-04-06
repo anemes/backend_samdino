@@ -9,8 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .data.label_store import LabelStore
 from .data.project_manager import ProjectManager
@@ -138,14 +139,20 @@ async def lifespan(app: FastAPI):
         dashboard = create_dashboard()
         if dashboard is not None:
             dashboard_port = config.server.dashboard_port
+            launch_kwargs = {
+                "server_name": "0.0.0.0",
+                "server_port": dashboard_port,
+                "share": False,
+                "quiet": True,
+            }
+            if config.server.dashboard_password:
+                launch_kwargs["auth"] = (
+                    config.server.dashboard_user,
+                    config.server.dashboard_password,
+                )
             dashboard_thread = threading.Thread(
                 target=dashboard.launch,
-                kwargs={
-                    "server_name": "0.0.0.0",
-                    "server_port": dashboard_port,
-                    "share": False,
-                    "quiet": True,
-                },
+                kwargs=launch_kwargs,
                 daemon=True,
             )
             dashboard_thread.start()
@@ -179,6 +186,24 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # API key auth middleware
+    from ..config.schema import get_config
+    _config = get_config()
+    _api_key = _config.server.api_key
+
+    @app.middleware("http")
+    async def auth_middleware(request: Request, call_next):
+        if not _api_key:
+            return await call_next(request)
+        if request.url.path in ("/health", "/docs", "/openapi.json"):
+            return await call_next(request)
+        auth = request.headers.get("Authorization", "")
+        if auth != f"Bearer {_api_key}":
+            return JSONResponse(
+                status_code=401, content={"detail": "Invalid or missing API key"}
+            )
+        return await call_next(request)
 
     # Mount API routes
     from .api import router as api_router

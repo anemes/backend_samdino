@@ -45,6 +45,9 @@ class TrainState:
     val_mIoU: float = 0.0
     best_val_mIoU: float = 0.0
     per_class_iou: Dict[str, float] = field(default_factory=dict)
+    per_class_f1: Dict[str, float] = field(default_factory=dict)
+    learning_rate: float = 0.0
+    epoch_time_s: float = 0.0
     dataset_stats: Optional[Dict] = None
     error_message: str = ""
     progress_pct: float = 0.0
@@ -116,6 +119,9 @@ class TrainService:
             "val_mIoU": self._state.val_mIoU,
             "best_val_mIoU": self._state.best_val_mIoU,
             "per_class_iou": self._state.per_class_iou,
+            "per_class_f1": self._state.per_class_f1,
+            "learning_rate": self._state.learning_rate,
+            "epoch_time_s": self._state.epoch_time_s,
             "dataset_stats": self._state.dataset_stats,
             "error_message": self._state.error_message,
             "progress_pct": self._state.progress_pct,
@@ -271,31 +277,42 @@ class TrainService:
 
                 self._state.epoch = epoch
                 self._state.progress_pct = epoch / cfg.epochs * 100
+                epoch_start = time.time()
 
                 # Train one epoch
-                train_loss = self._train_epoch(
-                    model, train_loader, criterion, optimizer, scaler, cfg.mixed_precision
+                train_loss, train_mIoU = self._train_epoch(
+                    model, train_loader, criterion, optimizer, scaler,
+                    cfg.mixed_precision, num_classes, data_cfg.ignore_index,
                 )
 
                 # Validate
-                val_loss, val_mIoU, per_class_iou = self._validate(
+                val_loss, val_mIoU, per_class_iou, per_class_f1 = self._validate(
                     model, val_loader, criterion, num_classes, data_cfg.ignore_index
                 )
 
                 scheduler.step()
+                epoch_time = time.time() - epoch_start
+                lr = optimizer.param_groups[0]["lr"]
 
                 # Update state
                 self._state.train_loss = train_loss
+                self._state.train_mIoU = train_mIoU
                 self._state.val_loss = val_loss
                 self._state.val_mIoU = val_mIoU
                 self._state.per_class_iou = {
                     class_names[i] if i < len(class_names) else f"class_{i}": iou
                     for i, iou in per_class_iou.items()
                 }
+                self._state.per_class_f1 = {
+                    class_names[i] if i < len(class_names) else f"class_{i}": f1
+                    for i, f1 in per_class_f1.items()
+                }
+                self._state.learning_rate = lr
+                self._state.epoch_time_s = epoch_time
 
                 logger.info(
-                    "Epoch %d/%d: train_loss=%.4f val_loss=%.4f val_mIoU=%.4f",
-                    epoch, cfg.epochs, train_loss, val_loss, val_mIoU,
+                    "Epoch %d/%d: train_loss=%.4f train_mIoU=%.4f val_loss=%.4f val_mIoU=%.4f lr=%.2e (%.1fs)",
+                    epoch, cfg.epochs, train_loss, train_mIoU, val_loss, val_mIoU, lr, epoch_time,
                 )
 
                 # Log metrics
@@ -304,13 +321,16 @@ class TrainService:
                     iteration=epoch,
                     epoch=epoch,
                     train_loss=train_loss,
-                    train_mIoU=0.0,  # computed during training if needed
+                    train_mIoU=train_mIoU,
                     val_loss=val_loss,
                     val_mIoU=val_mIoU,
                     per_class_iou={str(k): v for k, v in per_class_iou.items()},
+                    per_class_f1={str(k): v for k, v in per_class_f1.items()},
                     num_train_tiles=len(train_ds),
                     num_val_tiles=len(val_ds),
                     num_classes=num_classes,
+                    training_time_s=epoch_time,
+                    learning_rate=lr,
                 )
                 self.registry.log_metrics(metrics)
 
@@ -372,11 +392,12 @@ class TrainService:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    def _train_epoch(self, model, loader, criterion, optimizer, scaler, use_amp) -> float:
-        """Train for one epoch. Returns mean loss."""
+    def _train_epoch(self, model, loader, criterion, optimizer, scaler, use_amp, num_classes, ignore_index) -> tuple:
+        """Train for one epoch. Returns (mean_loss, train_mIoU)."""
         model.train()
         total_loss = 0.0
         num_batches = 0
+        confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
 
         for batch in loader:
             if self._stop_event.is_set():
@@ -397,7 +418,26 @@ class TrainService:
             total_loss += loss.item()
             num_batches += 1
 
-        return total_loss / max(num_batches, 1)
+            # Accumulate confusion matrix for train mIoU
+            with torch.no_grad():
+                preds = logits.argmax(dim=1).cpu().numpy()
+                targets = masks.cpu().numpy()
+                valid = targets != ignore_index
+                for p, t in zip(preds[valid], targets[valid]):
+                    if 0 <= p < num_classes and 0 <= t < num_classes:
+                        confusion[t, p] += 1
+
+        # Compute train mIoU
+        iou_values = []
+        for c in range(num_classes):
+            tp = confusion[c, c]
+            fp = confusion[:, c].sum() - tp
+            fn = confusion[c, :].sum() - tp
+            if tp + fp + fn > 0:
+                iou_values.append(float(tp / (tp + fp + fn)))
+        train_mIoU = float(np.mean(iou_values)) if iou_values else 0.0
+
+        return total_loss / max(num_batches, 1), train_mIoU
 
     @torch.no_grad()
     def _validate(self, model, loader, criterion, num_classes, ignore_index) -> tuple:
@@ -427,20 +467,25 @@ class TrainService:
                 if 0 <= p < num_classes and 0 <= t < num_classes:
                     confusion[t, p] += 1
 
-        # Compute per-class IoU
+        # Compute per-class IoU and F1
         per_class_iou = {}
+        per_class_f1 = {}
         for c in range(num_classes):
             tp = confusion[c, c]
             fp = confusion[:, c].sum() - tp
             fn = confusion[c, :].sum() - tp
             if tp + fp + fn > 0:
                 per_class_iou[c] = float(tp / (tp + fp + fn))
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+                per_class_f1[c] = float(f1)
 
         # Mean IoU (exclude classes with no samples)
         iou_values = [v for v in per_class_iou.values()]
         mIoU = float(np.mean(iou_values)) if iou_values else 0.0
 
-        return total_loss / max(num_batches, 1), mIoU, per_class_iou
+        return total_loss / max(num_batches, 1), mIoU, per_class_iou, per_class_f1
 
     @staticmethod
     def _compute_class_weights(

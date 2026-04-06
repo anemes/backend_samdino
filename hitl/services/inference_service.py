@@ -5,10 +5,12 @@ Runs inference in a background thread, producing GeoTIFF + vector outputs.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -205,6 +207,20 @@ class InferenceService:
                 simplify_tolerance=inf_cfg.vector_simplify_tolerance,
                 export_vectors=inf_cfg.output_vectors,
             )
+
+            # Save manifest
+            manifest = {
+                "job_id": job_id,
+                "timestamp": datetime.now().isoformat(),
+                "aoi_bounds": list(aoi_bounds),
+                "crs": raster_source.get_crs(),
+                "tiles_processed": self._state.tiles_processed,
+                "num_classes": num_classes,
+                "class_names": class_names,
+                "files": result_paths,
+            }
+            manifest_path = output_dir / f"{job_id}_manifest.json"
+            manifest_path.write_text(json.dumps(manifest, indent=2))
 
             self._state.result_paths = result_paths
             self._state.status = "complete"
