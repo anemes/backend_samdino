@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -23,6 +24,23 @@ from .services.train_service import TrainService
 from .utils.logging import setup_logging
 
 logger = logging.getLogger(__name__)
+
+_TRUTHY = {"1", "true", "yes", "on"}
+_FALSY = {"0", "false", "no", "off"}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean environment variable with a safe default."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    val = raw.strip().lower()
+    if val in _TRUTHY:
+        return True
+    if val in _FALSY:
+        return False
+    logger.warning("Invalid boolean for %s=%r; using default %s", name, raw, default)
+    return default
 
 
 @dataclass
@@ -132,35 +150,39 @@ async def lifespan(app: FastAPI):
     logger.info("Preloading SAM3 weights...")
     gpu_manager.acquire_sam3(config)
 
-    # Launch Gradio dashboard on separate port
+    # Launch Gradio dashboard on separate port unless explicitly disabled.
+    dashboard_enabled = _env_bool("HITL_ENABLE_DASHBOARD", True)
     dashboard_thread = None
-    try:
-        from .dashboard.app import create_dashboard
-        dashboard = create_dashboard()
-        if dashboard is not None:
-            dashboard_port = config.server.dashboard_port
-            launch_kwargs = {
-                "server_name": "0.0.0.0",
-                "server_port": dashboard_port,
-                "share": False,
-                "quiet": True,
-            }
-            if config.server.dashboard_password:
-                launch_kwargs["auth"] = (
-                    config.server.dashboard_user,
-                    config.server.dashboard_password,
+    if dashboard_enabled:
+        try:
+            from .dashboard.app import create_dashboard
+            dashboard = create_dashboard()
+            if dashboard is not None:
+                dashboard_port = config.server.dashboard_port
+                launch_kwargs = {
+                    "server_name": "0.0.0.0",
+                    "server_port": dashboard_port,
+                    "share": False,
+                    "quiet": True,
+                }
+                if config.server.dashboard_password:
+                    launch_kwargs["auth"] = (
+                        config.server.dashboard_user,
+                        config.server.dashboard_password,
+                    )
+                dashboard_thread = threading.Thread(
+                    target=dashboard.launch,
+                    kwargs=launch_kwargs,
+                    daemon=True,
                 )
-            dashboard_thread = threading.Thread(
-                target=dashboard.launch,
-                kwargs=launch_kwargs,
-                daemon=True,
-            )
-            dashboard_thread.start()
-            logger.info("Dashboard launched at http://localhost:%d", dashboard_port)
-        else:
-            logger.warning("Dashboard creation returned None (gradio not installed?)")
-    except Exception:
-        logger.exception("Dashboard launch failed")
+                dashboard_thread.start()
+                logger.info("Dashboard launched at http://localhost:%d", dashboard_port)
+            else:
+                logger.warning("Dashboard creation returned None (gradio not installed?)")
+        except Exception:
+            logger.exception("Dashboard launch failed")
+    else:
+        logger.info("Dashboard disabled via HITL_ENABLE_DASHBOARD.")
 
     yield
 
@@ -188,9 +210,9 @@ def create_app() -> FastAPI:
     )
 
     # API key auth middleware
-    from ..config.schema import get_config
+    from config.schema import get_config
     _config = get_config()
-    _api_key = _config.server.api_key
+    _api_key = os.getenv("HITL_API_KEY") or _config.server.api_key
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
@@ -227,10 +249,19 @@ app = create_app()
 
 if __name__ == "__main__":
     import uvicorn
+    from config.schema import load_config
+
+    config = load_config()
+    host = os.getenv("HOST", config.server.host)
+    try:
+        port = int(os.getenv("PORT", str(config.server.port)))
+    except ValueError:
+        logger.warning("Invalid PORT=%r; falling back to %d", os.getenv("PORT"), config.server.port)
+        port = config.server.port
 
     uvicorn.run(
         "hitl.app:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
+        host=host,
+        port=port,
+        reload=_env_bool("HITL_RELOAD", False),
     )

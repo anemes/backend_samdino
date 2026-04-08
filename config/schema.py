@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -147,7 +148,11 @@ def load_config(path: str | Path = None) -> AppConfig:
     if _config is not None:
         return _config
     if path is None:
-        path = Path(__file__).parent / "default.yaml"
+        env_path = os.getenv("HITL_CONFIG_PATH")
+        if env_path:
+            path = Path(env_path)
+        else:
+            path = Path(__file__).parent / "default.yaml"
     _config = AppConfig.from_yaml(path)
     return _config
 

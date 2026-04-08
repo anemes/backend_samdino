@@ -141,6 +141,17 @@ cd backend_samdino && docker compose --profile gpu up -d
 
 Then point the QGIS plugin at `http://localhost:8000`.
 
+## Azure Container Apps (GPU)
+
+A repeatable cmd.exe workflow is included under `scripts/aca/`:
+
+- `scripts/aca/01_setup_once.cmd` - one-time Azure Files setup + env registration
+- `scripts/aca/02_upload_data.cmd` - upload local model/runtime data
+- `scripts/aca/03_deploy.cmd` - build image + create/update Container App
+
+Configuration template: `scripts/aca/aca.env.cmd.example`  
+Detailed steps: `config/new_azure_file.md`
+
 ## Project Structure
 
 ```

@@ -30,3 +30,6 @@ Thumbs.db
 
 # Claude
 .claude/
+
+# Local Azure deployment config
+scripts/aca/aca.env.cmd

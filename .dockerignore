@@ -9,6 +9,7 @@ __pycache__
 .ruff_cache
 
 models
+data
 checkpoints
 dataset_cache
 tile_cache
