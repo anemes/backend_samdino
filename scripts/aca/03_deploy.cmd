@@ -51,6 +51,7 @@ if not defined MEMORY set "MEMORY=16.0Gi"
 if not defined MIN_REPLICAS set "MIN_REPLICAS=1"
 if not defined MAX_REPLICAS set "MAX_REPLICAS=10"
 if not defined ENABLE_DASHBOARD set "ENABLE_DASHBOARD=true"
+if not defined ALLOW_INSECURE set "ALLOW_INSECURE=false"
 if not defined REPO_ROOT (
   for %%i in ("%SCRIPT_DIR%..\..") do set "REPO_ROOT=%%~fi"
 )
@@ -64,6 +65,10 @@ if errorlevel 1 (
 )
 if /I not "%ENABLE_DASHBOARD%"=="true" if /I not "%ENABLE_DASHBOARD%"=="false" (
   echo ENABLE_DASHBOARD must be true or false.
+  exit /b 1
+)
+if /I not "%ALLOW_INSECURE%"=="true" if /I not "%ALLOW_INSECURE%"=="false" (
+  echo ALLOW_INSECURE must be true or false.
   exit /b 1
 )
 
@@ -118,6 +123,7 @@ set "TMP_YAML=%TEMP%\aca-%APP%-deploy.yaml"
   echo     activeRevisionsMode: Single
   echo     ingress:
   echo       external: true
+  echo       allowInsecure: %ALLOW_INSECURE%
   echo       targetPort: 8000
   echo       transport: auto
   echo     registries:
@@ -129,7 +135,7 @@ set "TMP_YAML=%TEMP%\aca-%APP%-deploy.yaml"
   echo         image: %IMAGE%
   echo         env:
   echo           - name: HITL_ENABLE_DASHBOARD
-  echo             value: %ENABLE_DASHBOARD%
+  echo             value: "%ENABLE_DASHBOARD%"
   echo         resources:
   echo           cpu: %CPU%
   echo           memory: %MEMORY%
