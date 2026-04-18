@@ -133,7 +133,7 @@ Explicit override:
 DOCKER_PLATFORM=linux/amd64 docker compose --profile gpu up --build
 ```
 
-The backend is exposed at `http://localhost:8000` and dashboard at `http://localhost:7860`.
+The backend is exposed at `http://localhost:8000` and dashboard at `http://localhost:8000/dashboard`.
 
 ### 3. Remote GPU with SSH tunnel (containerized)
 

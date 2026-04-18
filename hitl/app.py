@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -150,40 +149,6 @@ async def lifespan(app: FastAPI):
     logger.info("Preloading SAM3 weights...")
     gpu_manager.acquire_sam3(config)
 
-    # Launch Gradio dashboard on separate port unless explicitly disabled.
-    dashboard_enabled = _env_bool("HITL_ENABLE_DASHBOARD", True)
-    dashboard_thread = None
-    if dashboard_enabled:
-        try:
-            from .dashboard.app import create_dashboard
-            dashboard = create_dashboard()
-            if dashboard is not None:
-                dashboard_port = config.server.dashboard_port
-                launch_kwargs = {
-                    "server_name": "0.0.0.0",
-                    "server_port": dashboard_port,
-                    "share": False,
-                    "quiet": True,
-                }
-                if config.server.dashboard_password:
-                    launch_kwargs["auth"] = (
-                        config.server.dashboard_user,
-                        config.server.dashboard_password,
-                    )
-                dashboard_thread = threading.Thread(
-                    target=dashboard.launch,
-                    kwargs=launch_kwargs,
-                    daemon=True,
-                )
-                dashboard_thread.start()
-                logger.info("Dashboard launched at http://localhost:%d", dashboard_port)
-            else:
-                logger.warning("Dashboard creation returned None (gradio not installed?)")
-        except Exception:
-            logger.exception("Dashboard launch failed")
-    else:
-        logger.info("Dashboard disabled via HITL_ENABLE_DASHBOARD.")
-
     yield
 
     # Cleanup
@@ -209,16 +174,69 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # API key auth middleware
+    # Load config-backed auth defaults once.
     from config.schema import get_config
+
     _config = get_config()
     _api_key = os.getenv("HITL_API_KEY") or _config.server.api_key
+    _dashboard_has_basic_auth = False
 
+    # Mount dashboard under the same FastAPI app/port unless explicitly disabled.
+    dashboard_enabled = _env_bool("HITL_ENABLE_DASHBOARD", True)
+    if dashboard_enabled:
+        try:
+            import gradio as gr
+            from .dashboard.app import create_dashboard
+
+            dashboard = create_dashboard()
+            if dashboard is not None:
+                _dashboard_user = os.getenv(
+                    "HITL_DASHBOARD_USER", _config.server.dashboard_user
+                )
+                _dashboard_password = (
+                    os.getenv("HITL_DASHBOARD_PASSWORD")
+                    or _config.server.dashboard_password
+                )
+                if not _dashboard_password and _api_key:
+                    _dashboard_password = _api_key
+                    logger.warning(
+                        "HITL_DASHBOARD_PASSWORD not set; using HITL_API_KEY as /dashboard basic-auth password.",
+                    )
+                auth = None
+                if _dashboard_password:
+                    _dashboard_has_basic_auth = True
+                    auth = (_dashboard_user, _dashboard_password)
+                app = gr.mount_gradio_app(
+                    app,
+                    dashboard,
+                    path="/dashboard",
+                    auth=auth,
+                    root_path="/dashboard",
+                )
+                logger.info("Dashboard mounted at /dashboard")
+            else:
+                logger.warning("Dashboard creation returned None (gradio not installed?)")
+        except Exception:
+            logger.exception("Dashboard mount failed")
+    else:
+        logger.info("Dashboard disabled via HITL_ENABLE_DASHBOARD.")
+
+    # API key auth middleware
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
+        path = request.url.path
         if not _api_key:
             return await call_next(request)
-        if request.url.path in ("/health", "/docs", "/openapi.json"):
+        if path in ("/health", "/docs", "/openapi.json"):
+            return await call_next(request)
+        if _dashboard_has_basic_auth and (
+            path == "/dashboard"
+            or path.startswith("/dashboard/")
+            or path == "/gradio_api"
+            or path.startswith("/gradio_api/")
+            or path == "/manifest.json"
+            or path == "/favicon.ico"
+        ):
             return await call_next(request)
         auth = request.headers.get("Authorization", "")
         if auth != f"Bearer {_api_key}":

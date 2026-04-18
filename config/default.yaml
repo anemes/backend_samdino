@@ -78,16 +78,15 @@ paths:
 server:
   host: "0.0.0.0"
   port: 8000
-  dashboard_port: 7860
-  api_key: null           # set to enable API key auth on all endpoints
+  api_key: null           # set via HITL_API_KEY env var for secured deployments
   dashboard_user: "admin"
-  dashboard_password: null  # set to require Gradio login
+  dashboard_password: null  # set via HITL_DASHBOARD_PASSWORD env var
 
 # --- GPU ---
 gpu:
   device: "cuda"
   # Max VRAM to use (GB) - leave headroom for system
-  max_vram_gb: 20
+  max_vram_gb: 70
   # Extra VRAM reserved for training batches and gradients.
   # When max_vram_gb is large enough to fit SAM3 + segmentor + this overhead,
   # both models stay loaded simultaneously (no eviction on switch).

@@ -16,16 +16,38 @@ from __future__ import annotations
 import json
 import logging
 import math
+import threading
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
 import geopandas as gpd
-import numpy as np
-from shapely.geometry import mapping, shape
+import pandas as pd
+from shapely.geometry import MultiPolygon, shape
 
 logger = logging.getLogger(__name__)
+
+try:
+    import fiona
+except Exception:  # pragma: no cover - fallback for minimal runtime images
+    fiona = None
+
+
+_PATH_LOCKS: dict[str, threading.RLock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _shared_path_lock(path: Path) -> threading.RLock:
+    """Return a shared in-process lock for one GeoPackage path."""
+    key = str(path.resolve())
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PATH_LOCKS[key] = lock
+        return lock
 
 
 @dataclass
@@ -50,39 +72,220 @@ class LabelStore:
     ANNOTATIONS_LAYER = "annotations"
     REGIONS_LAYER = "regions"
     CLASSES_FILE = "classes.json"  # sidecar JSON (GeoPackage can't store non-geo tables cleanly)
+    IO_ENGINE = "fiona" if fiona is not None else "pyogrio"
+    WRITE_RETRIES = 8
+    WRITE_RETRY_DELAY_S = 0.15
 
     def __init__(self, gpkg_path: str | Path):
         self.path = Path(gpkg_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._classes_path = self.path.parent / self.CLASSES_FILE
+        self._io_lock = _shared_path_lock(self.path)
         self._ensure_layers()
 
     def _ensure_layers(self) -> None:
         """Create GeoPackage layers if they don't exist."""
-        if not self.path.exists():
-            # Create empty annotations layer
-            gdf = gpd.GeoDataFrame(
-                columns=[
-                    "geometry",
-                    "class_id",
-                    "region_id",
-                    "source",
-                    "iteration",
-                    "created_at",
-                    "status",
-                ],
-                geometry="geometry",
-                crs="EPSG:4326",
-            )
-            gdf.to_file(self.path, layer=self.ANNOTATIONS_LAYER, driver="GPKG")
+        layers = set()
+        if self.path.exists() and fiona is not None:
+            layers = set(fiona.listlayers(self.path))
+        elif self.path.exists():
+            # Best-effort fallback when fiona is unavailable.
+            layers = {self.ANNOTATIONS_LAYER, self.REGIONS_LAYER}
 
-            # Create empty regions layer
-            rgdf = gpd.GeoDataFrame(
-                columns=["geometry", "region_id", "created_at", "status"],
-                geometry="geometry",
+        if self.ANNOTATIONS_LAYER not in layers:
+            self._create_empty_layer(self.ANNOTATIONS_LAYER)
+            layers.add(self.ANNOTATIONS_LAYER)
+
+        if self.REGIONS_LAYER not in layers:
+            self._create_empty_layer(self.REGIONS_LAYER)
+
+    def _create_empty_layer(self, layer: str) -> None:
+        """Create an empty GPKG layer with explicit schema."""
+        if fiona is None:
+            if layer == self.ANNOTATIONS_LAYER:
+                gdf = self._empty_annotations_gdf("EPSG:4326")
+            else:
+                gdf = self._empty_regions_gdf("EPSG:4326")
+            self._write_layer(gdf, layer=layer, mode="w")
+            return
+
+        if layer == self.ANNOTATIONS_LAYER:
+            schema = {
+                "geometry": "Unknown",
+                "properties": {
+                    "class_id": "int",
+                    "region_id": "int",
+                    "source": "str",
+                    "iteration": "int",
+                    "created_at": "str",
+                    "status": "str",
+                },
+            }
+        else:
+            schema = {
+                "geometry": "Unknown",
+                "properties": {
+                    "region_id": "int",
+                    "created_at": "str",
+                    "status": "str",
+                },
+            }
+
+        with self._io_lock:
+            with fiona.open(
+                self.path,
+                mode="w",
+                driver="GPKG",
+                layer=layer,
                 crs="EPSG:4326",
+                schema=schema,
+            ):
+                pass
+
+    @staticmethod
+    def _empty_annotations_gdf(crs: str) -> gpd.GeoDataFrame:
+        return gpd.GeoDataFrame(
+            {
+                "class_id": pd.Series(dtype="int64"),
+                "region_id": pd.Series(dtype="int64"),
+                "source": pd.Series(dtype="str"),
+                "iteration": pd.Series(dtype="int64"),
+                "created_at": pd.Series(dtype="str"),
+                "status": pd.Series(dtype="str"),
+                "geometry": gpd.GeoSeries(dtype="geometry"),
+            },
+            geometry="geometry",
+            crs=crs,
+        )
+
+    @staticmethod
+    def _empty_regions_gdf(crs: str) -> gpd.GeoDataFrame:
+        return gpd.GeoDataFrame(
+            {
+                "region_id": pd.Series(dtype="int64"),
+                "created_at": pd.Series(dtype="str"),
+                "status": pd.Series(dtype="str"),
+                "geometry": gpd.GeoSeries(dtype="geometry"),
+            },
+            geometry="geometry",
+            crs=crs,
+        )
+
+    @staticmethod
+    def _is_missing_layer_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return (
+            "no such layer" in msg
+            or "layer does not exist" in msg
+            or "layer not found" in msg
+        )
+
+    def _write_layer(self, gdf: gpd.GeoDataFrame, layer: str, mode: str) -> None:
+        gdf = self._coerce_geometry_to_layer_schema(gdf, layer, mode)
+        with self._io_lock:
+            last_exc = None
+            for attempt in range(1, self.WRITE_RETRIES + 1):
+                try:
+                    gdf.to_file(
+                        self.path,
+                        layer=layer,
+                        driver="GPKG",
+                        mode=mode,
+                        engine=self.IO_ENGINE,
+                        index=False,
+                    )
+                    return
+                except Exception as exc:
+                    last_exc = exc
+                    if not self._is_locked_error(exc) or attempt == self.WRITE_RETRIES:
+                        raise
+                    delay = self.WRITE_RETRY_DELAY_S * attempt
+                    logger.warning(
+                        "GeoPackage write locked for %s/%s (attempt %d/%d); retrying in %.2fs",
+                        self.path,
+                        layer,
+                        attempt,
+                        self.WRITE_RETRIES,
+                        delay,
+                    )
+                    time.sleep(delay)
+            if last_exc is not None:
+                raise last_exc
+
+    def _coerce_geometry_to_layer_schema(
+        self, gdf: gpd.GeoDataFrame, layer: str, mode: str
+    ) -> gpd.GeoDataFrame:
+        """Coerce polygon geometry to the existing layer schema when appending.
+
+        Existing user stores may have either Polygon or MultiPolygon layers.
+        Fiona enforces strict type matching on append, so convert the incoming
+        geometry where lossless:
+        - Polygon -> MultiPolygon (safe promotion)
+        - single-part MultiPolygon -> Polygon (safe demotion)
+        """
+        if fiona is None or len(gdf) == 0:
+            return gdf
+        if mode != "a" or not self.path.exists():
+            return gdf
+
+        try:
+            with fiona.open(self.path, layer=layer, mode="r") as src:
+                schema_geom = (src.schema or {}).get("geometry")
+        except Exception:
+            return gdf
+
+        if not schema_geom:
+            return gdf
+
+        geom_type = str(schema_geom).lower()
+        out = gdf.copy()
+
+        if "multipolygon" in geom_type:
+            out["geometry"] = out.geometry.apply(
+                lambda geom: MultiPolygon([geom])
+                if geom is not None and getattr(geom, "geom_type", "") == "Polygon"
+                else geom
             )
-            rgdf.to_file(self.path, layer=self.REGIONS_LAYER, driver="GPKG")
+            return out
+
+        if geom_type.endswith("polygon") and "multipolygon" not in geom_type:
+            out["geometry"] = out.geometry.apply(
+                lambda geom: geom.geoms[0]
+                if geom is not None
+                and getattr(geom, "geom_type", "") == "MultiPolygon"
+                and len(getattr(geom, "geoms", [])) == 1
+                else geom
+            )
+            return out
+
+        return out
+
+    def _read_layer(self, layer: str, crs: str) -> gpd.GeoDataFrame:
+        with self._io_lock:
+            try:
+                gdf = gpd.read_file(self.path, layer=layer, engine=self.IO_ENGINE)
+            except Exception as exc:
+                if self._is_missing_layer_error(exc):
+                    return (
+                        self._empty_annotations_gdf(crs)
+                        if layer == self.ANNOTATIONS_LAYER
+                        else self._empty_regions_gdf(crs)
+                    )
+                raise
+
+        if len(gdf) > 0 and gdf.crs and gdf.crs.to_epsg() != int(crs.split(":")[1]):
+            gdf = gdf.to_crs(crs)
+        return gdf
+
+    @staticmethod
+    def _is_locked_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return (
+            "database is locked" in msg
+            or "failed to commit transaction" in msg
+            or "transactionerror" in msg
+            or "sqlite busy" in msg
+        )
 
     @staticmethod
     def _ensure_status_column(gdf: gpd.GeoDataFrame, default: str) -> gpd.GeoDataFrame:
@@ -146,19 +349,7 @@ class LabelStore:
             ],
             crs=crs,
         )
-
-        if len(existing) > 0:
-            existing = self._ensure_status_column(existing, "active")
-            combined = gpd.GeoDataFrame(
-                data=list(existing.drop(columns="geometry").to_dict("records"))
-                + list(new_row.drop(columns="geometry").to_dict("records")),
-                geometry=list(existing.geometry) + list(new_row.geometry),
-                crs=crs,
-            )
-        else:
-            combined = new_row
-
-        combined.to_file(self.path, layer=self.REGIONS_LAYER, driver="GPKG")
+        self._write_layer(new_row, layer=self.REGIONS_LAYER, mode="a")
         logger.info("Added annotation region %d (status=%s)", region_id, status)
         return region_id
 
@@ -166,20 +357,11 @@ class LabelStore:
         self, crs: str = "EPSG:4326", status: Optional[str] = None,
     ) -> gpd.GeoDataFrame:
         """Get annotation regions, optionally filtered by status."""
-        try:
-            gdf = gpd.read_file(self.path, layer=self.REGIONS_LAYER)
-            gdf = self._ensure_status_column(gdf, "active")
-            if len(gdf) > 0 and gdf.crs and gdf.crs.to_epsg() != int(crs.split(":")[1]):
-                gdf = gdf.to_crs(crs)
-            if status is not None and len(gdf) > 0:
-                gdf = gdf[gdf["status"] == status]
-            return gdf
-        except Exception:
-            return gpd.GeoDataFrame(
-                columns=["geometry", "region_id", "created_at", "status"],
-                geometry="geometry",
-                crs=crs,
-            )
+        gdf = self._read_layer(self.REGIONS_LAYER, crs=crs)
+        gdf = self._ensure_status_column(gdf, "active")
+        if status is not None and len(gdf) > 0:
+            gdf = gdf[gdf["status"] == status]
+        return gdf
 
     # --- Annotation operations ---
 
@@ -195,6 +377,7 @@ class LabelStore:
     ) -> int:
         """Add a labeled polygon annotation. Returns row index."""
         existing = self.get_annotations(crs=crs)
+        index = len(existing)
 
         new_row = gpd.GeoDataFrame(
             [
@@ -210,20 +393,8 @@ class LabelStore:
             ],
             crs=crs,
         )
-
-        if len(existing) > 0:
-            existing = self._ensure_status_column(existing, "approved")
-            combined = gpd.GeoDataFrame(
-                data=list(existing.drop(columns="geometry").to_dict("records"))
-                + list(new_row.drop(columns="geometry").to_dict("records")),
-                geometry=list(existing.geometry) + list(new_row.geometry),
-                crs=crs,
-            )
-        else:
-            combined = new_row
-
-        combined.to_file(self.path, layer=self.ANNOTATIONS_LAYER, driver="GPKG")
-        return len(combined) - 1
+        self._write_layer(new_row, layer=self.ANNOTATIONS_LAYER, mode="a")
+        return index
 
     def get_annotations(
         self,
@@ -232,30 +403,13 @@ class LabelStore:
         status: Optional[str] = None,
     ) -> gpd.GeoDataFrame:
         """Get annotations, optionally filtered by region_id and/or status."""
-        try:
-            gdf = gpd.read_file(self.path, layer=self.ANNOTATIONS_LAYER)
-            gdf = self._ensure_status_column(gdf, "approved")
-            if len(gdf) > 0 and gdf.crs and gdf.crs.to_epsg() != int(crs.split(":")[1]):
-                gdf = gdf.to_crs(crs)
-            if region_id is not None and len(gdf) > 0:
-                gdf = gdf[gdf["region_id"] == region_id]
-            if status is not None and len(gdf) > 0:
-                gdf = gdf[gdf["status"] == status]
-            return gdf
-        except Exception:
-            return gpd.GeoDataFrame(
-                columns=[
-                    "geometry",
-                    "class_id",
-                    "region_id",
-                    "source",
-                    "iteration",
-                    "created_at",
-                    "status",
-                ],
-                geometry="geometry",
-                crs=crs,
-            )
+        gdf = self._read_layer(self.ANNOTATIONS_LAYER, crs=crs)
+        gdf = self._ensure_status_column(gdf, "approved")
+        if region_id is not None and len(gdf) > 0:
+            gdf = gdf[gdf["region_id"] == region_id]
+        if status is not None and len(gdf) > 0:
+            gdf = gdf[gdf["status"] == status]
+        return gdf
 
     def delete_annotations_in_region(self, region_id: int) -> int:
         """Delete all annotations inside a region. Returns count deleted."""
@@ -263,7 +417,7 @@ class LabelStore:
         before = len(gdf)
         gdf = gdf[gdf["region_id"] != region_id]
         after = len(gdf)
-        gdf.to_file(self.path, layer=self.ANNOTATIONS_LAYER, driver="GPKG")
+        self._write_layer(gdf, layer=self.ANNOTATIONS_LAYER, mode="w")
         deleted = before - after
         logger.info("Deleted %d annotations from region %d", deleted, region_id)
         return deleted
@@ -274,7 +428,7 @@ class LabelStore:
         if annotation_index < 0 or annotation_index >= len(gdf):
             return False
         gdf = gdf.drop(gdf.index[annotation_index]).reset_index(drop=True)
-        gdf.to_file(self.path, layer=self.ANNOTATIONS_LAYER, driver="GPKG")
+        self._write_layer(gdf, layer=self.ANNOTATIONS_LAYER, mode="w")
         logger.info("Deleted annotation at index %d", annotation_index)
         return True
 
@@ -283,7 +437,7 @@ class LabelStore:
         deleted = self.delete_annotations_in_region(region_id)
         regions = self.get_regions()
         regions = regions[regions["region_id"] != region_id]
-        regions.to_file(self.path, layer=self.REGIONS_LAYER, driver="GPKG")
+        self._write_layer(regions, layer=self.REGIONS_LAYER, mode="w")
         logger.info("Deleted region %d (and %d annotations)", region_id, deleted)
         return deleted
 
@@ -341,7 +495,7 @@ class LabelStore:
         if mask.sum() == 0:
             raise ValueError(f"Region {region_id} not found")
         regions.loc[mask, "status"] = "active"
-        regions.to_file(self.path, layer=self.REGIONS_LAYER, driver="GPKG")
+        self._write_layer(regions, layer=self.REGIONS_LAYER, mode="w")
 
         # Update annotation statuses
         annotations = self.get_annotations()
@@ -349,7 +503,7 @@ class LabelStore:
         count = int(ann_mask.sum())
         if count > 0:
             annotations.loc[ann_mask, "status"] = "approved"
-            annotations.to_file(self.path, layer=self.ANNOTATIONS_LAYER, driver="GPKG")
+            self._write_layer(annotations, layer=self.ANNOTATIONS_LAYER, mode="w")
 
         logger.info("Approved region %d (%d annotations)", region_id, count)
         return count
@@ -365,7 +519,6 @@ class LabelStore:
         status: str = "in_review",
     ) -> int:
         """Add multiple annotations at once. Returns count added."""
-        existing = self.get_annotations(crs=crs)
         now = datetime.now().isoformat()
 
         # Filter out invalid geometries (empty or with non-finite coordinates)
@@ -404,17 +557,6 @@ class LabelStore:
             crs=crs,
         )
 
-        if len(existing) > 0:
-            existing = self._ensure_status_column(existing, "approved")
-            combined = gpd.GeoDataFrame(
-                data=list(existing.drop(columns="geometry").to_dict("records"))
-                + list(new_rows.drop(columns="geometry").to_dict("records")),
-                geometry=list(existing.geometry) + list(new_rows.geometry),
-                crs=crs,
-            )
-        else:
-            combined = new_rows
-
-        combined.to_file(self.path, layer=self.ANNOTATIONS_LAYER, driver="GPKG")
+        self._write_layer(new_rows, layer=self.ANNOTATIONS_LAYER, mode="a")
         logger.info("Bulk added %d annotations to region %d", len(valid_pairs), region_id)
         return len(valid_pairs)

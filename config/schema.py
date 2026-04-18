@@ -89,7 +89,6 @@ class PathsConfig(BaseModel):
 class ServerConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8000
-    dashboard_port: int = 7860
     api_key: Optional[str] = None
     dashboard_user: str = "admin"
     dashboard_password: Optional[str] = None
