@@ -45,7 +45,6 @@ class AcceptRequest(BaseModel):
     class_id: int
     region_id: int
     crs: str = "EPSG:4326"
-    simplify_tolerance: float = 1.0
 
 
 # --- Dependencies ---
@@ -158,17 +157,17 @@ def accept_mask(
     affine transform from the session's GeoTIFF) and saves to the label store.
     """
     if not sam.has_session:
+        logger.warning("SAM accept rejected: no active session")
         raise HTTPException(status_code=400, detail="No active SAM session")
 
-    polygon = sam.mask_to_polygon(
-        crs=req.crs,
-        simplify_tolerance=req.simplify_tolerance,
-    )
+    polygon = sam.mask_to_polygon(crs=req.crs)
 
     if polygon is None:
+        logger.warning("SAM accept rejected: mask_to_polygon returned None")
         raise HTTPException(status_code=400, detail="No valid mask to accept")
 
     if req.class_id < 2:
+        logger.warning("SAM accept rejected: class_id=%d < 2", req.class_id)
         raise HTTPException(
             status_code=400,
             detail="class_id must be >= 2 (0=ignore, 1=background are implicit)",
@@ -176,6 +175,10 @@ def accept_mask(
 
     # Validate annotation is inside the target region
     if not store.check_annotation_in_region(polygon, req.region_id, crs=req.crs):
+        logger.warning(
+            "SAM accept rejected: centroid outside region %d (crs=%s)",
+            req.region_id, req.crs,
+        )
         raise HTTPException(
             status_code=400,
             detail=f"SAM3 mask centroid is outside region {req.region_id}. "
@@ -194,6 +197,15 @@ def accept_mask(
         source="sam3",
         status=ann_status,
     )
+
+    # Save raw binary mask for pixel-perfect training data
+    masks_dir = Path(store.path).parent / "sam_masks"
+    masks_dir.mkdir(exist_ok=True)
+    mask_path = masks_dir / f"ann_{idx:06d}.tif"
+    try:
+        sam.save_mask(str(mask_path), class_id=req.class_id)
+    except Exception:
+        logger.warning("Failed to save raw SAM mask for annotation %d", idx, exc_info=True)
 
     # Reset prompts for next object (keep image loaded)
     session = sam.session

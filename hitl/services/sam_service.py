@@ -195,7 +195,6 @@ class SAMService:
     def mask_to_polygon(
         self,
         crs: str = "EPSG:4326",
-        simplify_tolerance: float = 1.0,
     ) -> Optional[dict]:
         """Convert the current mask to a GeoJSON polygon.
 
@@ -203,9 +202,12 @@ class SAMService:
         so the polygon is in real geo-coordinates. If `crs` differs from the
         image CRS, the polygon is reprojected.
 
+        The binary mask is smoothed before vectorization to fill small holes,
+        remove tiny fragments, and produce smoother polygon edges.
+        Simplification is adaptive based on the feature's physical size.
+
         Args:
             crs: Target CRS for the output polygon.
-            simplify_tolerance: Simplification tolerance in CRS units.
 
         Returns:
             GeoJSON geometry dict, or None if no mask.
@@ -229,9 +231,22 @@ class SAMService:
             image_crs, crs, affine,
         )
 
-        # Ensure mask is boolean/uint8 for rasterio
-        mask_uint8 = mask.astype(np.uint8)
+        mask_uint8 = (mask.astype(np.uint8) * 255)
+        pixel_count = int(mask.sum())
+
+        # Only apply morphological smoothing on large masks (>500 pixels).
+        # Small masks (dams, narrow structures) are left as-is to preserve detail.
+        if pixel_count > 500:
+            import cv2
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            mask_uint8 = cv2.morphologyEx(mask_uint8, cv2.MORPH_CLOSE, kernel)
+            mask_uint8 = cv2.morphologyEx(mask_uint8, cv2.MORPH_OPEN, kernel)
+            mask_uint8 = cv2.GaussianBlur(mask_uint8, (5, 5), sigmaX=1.0)
+            mask_uint8 = (mask_uint8 > 127).astype(np.uint8)
+
         mask_bool = mask_uint8.astype(bool)
+        logger.info("mask_to_polygon: %d mask pixels (smoothing %s)",
+                     pixel_count, "applied" if pixel_count > 500 else "skipped")
 
         # Extract polygon shapes from binary mask using the real geo-transform
         shapes_iter = list(rasterio.features.shapes(
@@ -250,9 +265,20 @@ class SAMService:
 
         merged = unary_union(polygons)
 
-        # Simplify to reduce vertex count
-        if simplify_tolerance > 0:
-            merged = merged.simplify(simplify_tolerance, preserve_topology=True)
+        # Keep only the largest polygon (discard tiny fragments)
+        if merged.geom_type == "MultiPolygon":
+            merged = max(merged.geoms, key=lambda g: g.area)
+
+        # Simplify large features at 1m tolerance; skip for small ones
+        # where morphological smoothing already handles edge quality.
+        from pyproj import CRS as ProjCRS
+        is_geographic = ProjCRS.from_user_input(image_crs).is_geographic
+        bounds = merged.bounds
+        extent = max(bounds[2] - bounds[0], bounds[3] - bounds[1])
+        extent_m = extent * 111_000 if is_geographic else extent
+        if extent_m > 50:
+            tol = 1.0 / 111_000 if is_geographic else 1.0
+            merged = merged.simplify(tol, preserve_topology=True)
 
         if merged.is_empty:
             return None
@@ -273,6 +299,34 @@ class SAMService:
         merged = wkt_loads(wkt_dumps(merged, rounding_precision=6))
 
         return mapping(merged)
+
+    def save_mask(self, output_path: str, class_id: int) -> None:
+        """Save the current binary mask as a single-band GeoTIFF.
+
+        Pixel values: class_id where mask=True, 0 elsewhere.
+        Uses the affine transform and CRS from the session's source image.
+        """
+        if self._session is None or self._session.current_mask is None:
+            return
+
+        import rasterio
+
+        mask = self._session.current_mask
+        with rasterio.open(self._session.image_path) as src:
+            affine = src.transform
+            crs = src.crs
+
+        mask_data = np.where(mask, class_id, 0).astype(np.uint8)
+        with rasterio.open(
+            output_path, "w", driver="GTiff",
+            height=mask_data.shape[0], width=mask_data.shape[1],
+            count=1, dtype="uint8", crs=crs, transform=affine,
+            compress="deflate",
+        ) as dst:
+            dst.write(mask_data, 1)
+
+        logger.info("Saved raw SAM mask to %s (%dx%d, class_id=%d)",
+                     output_path, mask_data.shape[1], mask_data.shape[0], class_id)
 
     def reset(self) -> None:
         """Clear the current session (keeps SAM3 model loaded)."""

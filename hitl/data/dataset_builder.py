@@ -218,12 +218,19 @@ class DatasetBuilder:
     ) -> np.ndarray:
         """Rasterize labels within an annotation region.
 
+        For SAM3 annotations that have a saved raw binary mask, the mask is
+        reprojected onto the region grid directly (pixel-perfect). For manual
+        annotations or SAM3 annotations without saved masks, the polygon is
+        rasterized as before.
+
         Returns:
             (H, W) uint8 array with class IDs.
             - Inside region, no label → background_class_id (1)
             - Inside region, has label → class_id (2+)
             - Outside region → ignore_index (0)
         """
+        from rasterio.warp import reproject, Resampling
+
         transform = from_bounds(*bounds, width, height)
 
         # Start with ignore everywhere
@@ -233,15 +240,47 @@ class DatasetBuilder:
         region_shapes = [(region_geom, self.background_class_id)]
         rasterize(region_shapes, out=mask, transform=transform, dtype=np.uint8)
 
-        # Rasterize annotation polygons on top
-        if len(annotations) > 0:
-            ann_shapes = [
-                (row.geometry, int(row["class_id"]))
-                for _, row in annotations.iterrows()
-                if row.geometry is not None and not row.geometry.is_empty
-            ]
-            if ann_shapes:
-                rasterize(ann_shapes, out=mask, transform=transform, dtype=np.uint8)
+        if len(annotations) == 0:
+            return mask
+
+        # Directory where SAM3 raw masks are stored (alongside labels.gpkg)
+        sam_masks_dir = self.label_store.path.parent / "sam_masks"
+
+        # Separate annotations with raw masks from those needing polygon rasterization
+        polygon_shapes = []
+        for _, row in annotations.iterrows():
+            if row.geometry is None or row.geometry.is_empty:
+                continue
+
+            ann_idx = int(row.name)
+            raw_mask_path = sam_masks_dir / f"ann_{ann_idx:06d}.tif"
+
+            if raw_mask_path.exists():
+                # Use pixel-perfect raw mask — reproject/resample to region grid
+                try:
+                    with rasterio.open(raw_mask_path) as src:
+                        raw = np.zeros((height, width), dtype=np.uint8)
+                        reproject(
+                            source=rasterio.band(src, 1),
+                            destination=raw,
+                            dst_transform=transform,
+                            dst_crs=src.crs,
+                            resampling=Resampling.nearest,
+                        )
+                        mask[raw > 0] = raw[raw > 0]
+                except Exception:
+                    logger.warning(
+                        "Failed to read raw mask %s, falling back to polygon",
+                        raw_mask_path, exc_info=True,
+                    )
+                    polygon_shapes.append((row.geometry, int(row["class_id"])))
+            else:
+                # Manual annotation or old SAM3 without saved mask
+                polygon_shapes.append((row.geometry, int(row["class_id"])))
+
+        # Rasterize remaining polygon annotations
+        if polygon_shapes:
+            rasterize(polygon_shapes, out=mask, transform=transform, dtype=np.uint8)
 
         return mask
 
