@@ -211,7 +211,6 @@ def create_app() -> FastAPI:
                     dashboard,
                     path="/dashboard",
                     auth=auth,
-                    root_path="/dashboard",
                 )
                 logger.info("Dashboard mounted at /dashboard")
             else:
@@ -249,14 +248,10 @@ def create_app() -> FastAPI:
     from .api import router as api_router
     app.include_router(api_router)
 
-    # Health check
+    # Health probe (unauthenticated — no internal details)
     @app.get("/health")
     def health():
-        return {
-            "status": "ok",
-            "gpu_active": app_state.gpu_manager.active_model.value if app_state else "unknown",
-            "gpu_vram_mb": app_state.gpu_manager.vram_usage_mb() if app_state else 0,
-        }
+        return {"status": "ok"}
 
     return app
 

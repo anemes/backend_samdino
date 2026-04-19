@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import sqlite3
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -73,8 +74,8 @@ class LabelStore:
     REGIONS_LAYER = "regions"
     CLASSES_FILE = "classes.json"  # sidecar JSON (GeoPackage can't store non-geo tables cleanly)
     IO_ENGINE = "fiona" if fiona is not None else "pyogrio"
-    WRITE_RETRIES = 8
-    WRITE_RETRY_DELAY_S = 0.15
+    WRITE_RETRIES = 12
+    WRITE_RETRY_DELAY_S = 0.25
 
     def __init__(self, gpkg_path: str | Path):
         self.path = Path(gpkg_path)
@@ -82,6 +83,23 @@ class LabelStore:
         self._classes_path = self.path.parent / self.CLASSES_FILE
         self._io_lock = _shared_path_lock(self.path)
         self._ensure_layers()
+        self._set_sqlite_pragmas()
+
+    def _set_sqlite_pragmas(self) -> None:
+        """Set SQLite pragmas for network filesystem compatibility.
+
+        WAL mode requires shared memory (-shm file) which doesn't work on
+        network mounts like Azure Files SMB. DELETE journal mode uses
+        traditional rollback journaling that works everywhere.
+        """
+        if not self.path.exists():
+            return
+        try:
+            with sqlite3.connect(str(self.path)) as conn:
+                conn.execute("PRAGMA journal_mode=DELETE")
+                conn.execute("PRAGMA busy_timeout=5000")
+        except Exception:
+            logger.warning("Could not set SQLite pragmas on %s", self.path, exc_info=True)
 
     def _ensure_layers(self) -> None:
         """Create GeoPackage layers if they don't exist."""
@@ -111,7 +129,7 @@ class LabelStore:
 
         if layer == self.ANNOTATIONS_LAYER:
             schema = {
-                "geometry": "Unknown",
+                "geometry": "MultiPolygon",
                 "properties": {
                     "class_id": "int",
                     "region_id": "int",
@@ -123,7 +141,7 @@ class LabelStore:
             }
         else:
             schema = {
-                "geometry": "Unknown",
+                "geometry": "MultiPolygon",
                 "properties": {
                     "region_id": "int",
                     "created_at": "str",
@@ -180,8 +198,20 @@ class LabelStore:
             or "layer not found" in msg
         )
 
+    # CRS used for all GPKG layers — must match _create_empty_layer().
+    _STORAGE_CRS = "EPSG:4326"
+
     def _write_layer(self, gdf: gpd.GeoDataFrame, layer: str, mode: str) -> None:
-        gdf = self._coerce_geometry_to_layer_schema(gdf, layer, mode)
+        gdf = self._promote_to_multi(gdf)
+        # Reproject to storage CRS before writing.  Fiona does NOT reproject
+        # on append, so EPSG:3857 coordinates would be stored as-is in the
+        # EPSG:4326 layer — producing wildly wrong values.
+        if (
+            len(gdf) > 0
+            and gdf.crs is not None
+            and gdf.crs.to_epsg() != 4326
+        ):
+            gdf = gdf.to_crs(self._STORAGE_CRS)
         with self._io_lock:
             last_exc = None
             for attempt in range(1, self.WRITE_RETRIES + 1):
@@ -212,53 +242,28 @@ class LabelStore:
             if last_exc is not None:
                 raise last_exc
 
-    def _coerce_geometry_to_layer_schema(
-        self, gdf: gpd.GeoDataFrame, layer: str, mode: str
-    ) -> gpd.GeoDataFrame:
-        """Coerce polygon geometry to the existing layer schema when appending.
+    @staticmethod
+    def _promote_to_multi(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        """Promote any Polygon geometries to MultiPolygon.
 
-        Existing user stores may have either Polygon or MultiPolygon layers.
-        Fiona enforces strict type matching on append, so convert the incoming
-        geometry where lossless:
-        - Polygon -> MultiPolygon (safe promotion)
-        - single-part MultiPolygon -> Polygon (safe demotion)
+        Layers are created with MultiPolygon schema. Fiona enforces strict
+        type matching on append, so all geometries must be MultiPolygon.
+        Modifies in-place since callers always pass freshly-constructed frames.
         """
-        if fiona is None or len(gdf) == 0:
+        if len(gdf) == 0:
             return gdf
-        if mode != "a" or not self.path.exists():
+        needs_promotion = False
+        for geom in gdf.geometry:
+            if geom is not None and geom.geom_type == "Polygon":
+                needs_promotion = True
+                break
+        if not needs_promotion:
             return gdf
-
-        try:
-            with fiona.open(self.path, layer=layer, mode="r") as src:
-                schema_geom = (src.schema or {}).get("geometry")
-        except Exception:
-            return gdf
-
-        if not schema_geom:
-            return gdf
-
-        geom_type = str(schema_geom).lower()
-        out = gdf.copy()
-
-        if "multipolygon" in geom_type:
-            out["geometry"] = out.geometry.apply(
-                lambda geom: MultiPolygon([geom])
-                if geom is not None and getattr(geom, "geom_type", "") == "Polygon"
-                else geom
-            )
-            return out
-
-        if geom_type.endswith("polygon") and "multipolygon" not in geom_type:
-            out["geometry"] = out.geometry.apply(
-                lambda geom: geom.geoms[0]
-                if geom is not None
-                and getattr(geom, "geom_type", "") == "MultiPolygon"
-                and len(getattr(geom, "geoms", [])) == 1
-                else geom
-            )
-            return out
-
-        return out
+        gdf["geometry"] = [
+            MultiPolygon([g]) if g is not None and g.geom_type == "Polygon" else g
+            for g in gdf.geometry
+        ]
+        return gdf
 
     def _read_layer(self, layer: str, crs: str) -> gpd.GeoDataFrame:
         with self._io_lock:
@@ -276,6 +281,24 @@ class LabelStore:
         if len(gdf) > 0 and gdf.crs and gdf.crs.to_epsg() != int(crs.split(":")[1]):
             gdf = gdf.to_crs(crs)
         return gdf
+
+    def _count_layer(self, layer: str) -> int:
+        """Return the number of records in a layer without reading all data."""
+        if not self.path.exists():
+            return 0
+        if fiona is not None:
+            try:
+                with self._io_lock:
+                    with fiona.open(self.path, layer=layer, mode="r") as src:
+                        return len(src)
+            except Exception:
+                return 0
+        # Fallback: full read
+        try:
+            gdf = self._read_layer(layer, crs="EPSG:4326")
+            return len(gdf)
+        except Exception:
+            return 0
 
     @staticmethod
     def _is_locked_error(exc: Exception) -> bool:
@@ -335,8 +358,7 @@ class LabelStore:
         self, geometry_geojson: dict, crs: str = "EPSG:4326", status: str = "active",
     ) -> int:
         """Add an annotation region. Returns assigned region_id."""
-        existing = self.get_regions(crs=crs)
-        region_id = len(existing) + 1
+        region_id = self._count_layer(self.REGIONS_LAYER) + 1
 
         new_row = gpd.GeoDataFrame(
             [
@@ -376,8 +398,7 @@ class LabelStore:
         status: str = "approved",
     ) -> int:
         """Add a labeled polygon annotation. Returns row index."""
-        existing = self.get_annotations(crs=crs)
-        index = len(existing)
+        index = self._count_layer(self.ANNOTATIONS_LAYER)
 
         new_row = gpd.GeoDataFrame(
             [

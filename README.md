@@ -57,7 +57,7 @@ Edit `config/default.yaml`:
 
 Model weights are not included in the repo. Place them in `data/models/` (gitignored) or point the config to an external path.
 
-## Run
+## Run (local, no Docker)
 
 ```bash
 python -m hitl.app
@@ -65,67 +65,50 @@ python -m hitl.app
 
 - REST API: `http://localhost:8000`
 - API docs: `http://localhost:8000/docs`
-- Training dashboard: `http://localhost:7860`
+- Dashboard: `http://localhost:8000/dashboard`
 
-## Run With Docker
+## Run With Docker (local test)
 
 ### Prerequisites
 
-- Docker Desktop (Mac/Windows) or Docker Engine + Compose plugin (Linux)
-- Model weights present on host under `./data/models`:
+- Docker Engine + Compose plugin (or Docker Desktop)
+- NVIDIA Container Toolkit (for GPU profile)
+- Model weights under `./data/models/`:
   - `./data/models/dinov3-vitl16-pretrain-sat493m/...`
   - `./data/models/sam3/sam3.pt`
-- Docker image dependencies are installed with `uv sync --frozen` from `uv.lock`
 
 ### First-time setup
 
-Create the data directory before the first build so Docker doesn't create it as root:
-
 ```bash
 mkdir -p data/models
+# Place model weights in data/models/ before building
 ```
 
-All runtime data (projects, checkpoints, caches) is stored under `data/` and shared between local and Docker runs.
-
-### CPU profile (Mac/Linux/Windows)
-
-```bash
-docker compose --profile cpu up --build
-```
-
-`docker-compose.yml` defaults containers to `linux/amd64` via `DOCKER_PLATFORM` so SAM3 works on Apple Silicon Macs.
-CPU profile installs PyTorch CPU wheels only and skips `nvidia-*` CUDA packages.
-
-If you want to force platform explicitly:
-
-```bash
-DOCKER_PLATFORM=linux/amd64 docker compose --profile cpu up --build
-```
-
-### GPU profile (Linux/Windows with NVIDIA)
-
-Requires NVIDIA Container Toolkit / WSL2 GPU integration.  
-GPU profile installs CUDA 12.1 PyTorch wheels.
+### Build and run
 
 ```bash
 docker compose --profile gpu up --build
 ```
 
-If needed, force platform explicitly:
-
-```bash
-DOCKER_PLATFORM=linux/amd64 docker compose --profile gpu up --build
-```
+All runtime data (projects, checkpoints, caches) is stored under `data/` and shared between local and Docker runs.
 
 ### Endpoints
 
 - REST API: `http://localhost:8000`
 - API docs: `http://localhost:8000/docs`
-- Training dashboard: `http://localhost:7860`
+- Dashboard: `http://localhost:8000/dashboard`
 
-### Persistent data
+### Verify it works
 
-The compose setup mounts `./data` → `/app/data` for persistence. This is the same directory used by local runs, so projects and checkpoints are shared between both modes.
+```bash
+# Health check
+curl http://localhost:8000/health
+
+# Open dashboard in browser
+xdg-open http://localhost:8000/dashboard  # Linux
+```
+
+Then connect the QGIS plugin to `http://localhost:8000`, create a project, draw a region, and test SAM labeling.
 
 ## Remote GPU (SSH tunnel)
 
@@ -135,7 +118,7 @@ Run the backend on a GPU machine, access from a local QGIS client:
 # Local machine
 ssh -L 8000:localhost:8000 gpu-machine
 
-# GPU machine (containerized)
+# GPU machine
 cd backend_samdino && docker compose --profile gpu up -d
 ```
 
@@ -143,14 +126,16 @@ Then point the QGIS plugin at `http://localhost:8000`.
 
 ## Azure Container Apps (GPU)
 
-A repeatable cmd.exe workflow is included under `scripts/aca/`:
+Repeatable deployment scripts for ACA with GPU workload profiles and Azure Files storage are in [`scripts/aca/`](scripts/aca/README.md).
 
-- `scripts/aca/01_setup_once.cmd` - one-time Azure Files setup + env registration
-- `scripts/aca/02_upload_data.cmd` - upload local model/runtime data
-- `scripts/aca/03_deploy.cmd` - build image + create/update Container App
+Quick start:
 
-Configuration template: `scripts/aca/aca.env.cmd.example`  
-Detailed steps: `config/new_azure_file.md`
+1. Copy `scripts/aca/aca.env.sh.example` → `scripts/aca/aca.env.sh` and edit
+2. `01_setup_once.sh` — one-time Azure Files + environment setup
+3. `02_upload_data.sh` — upload model weights and data
+4. `03_deploy.sh` — build image and deploy (or `--skip-build` for config-only changes)
+
+See [`scripts/aca/README.md`](scripts/aca/README.md) for full first-deploy, redeployment, auth setup, and troubleshooting instructions.
 
 ## Project Structure
 

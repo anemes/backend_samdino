@@ -1,92 +1,184 @@
-# ACA Scripts: Post-Deploy Changes
+# ACA Deployment Scripts
 
-This guide is for **changes after initial ACA setup**.
-Commands below are for **Command Prompt (`cmd.exe`)**.
+Deploy the HITL backend to Azure Container Apps with GPU and Azure Files storage.
 
-## 0) Load env vars
+All commands below show both **bash** and **cmd.exe** variants.
 
-```cmd
-call scripts\aca\aca.env.cmd
+## First Deployment
+
+### 1. Create env config
+
+```bash
+cp scripts/aca/aca.env.sh.example scripts/aca/aca.env.sh
 ```
 
-## 1) Which command to run for which change
-
-- **Code/dependency change** (Python code, Dockerfile, requirements):
-  - rebuild image + deploy:
-  ```cmd
-  call scripts\aca\03_deploy.cmd
-  ```
-- **No code change** (just ACA config/env/secrets/ingress/image already in ACR):
-  - deploy without rebuild:
-  ```cmd
-  call scripts\aca\03_deploy.cmd --skip-build
-  ```
-- **Only swap to an image tag that already exists in ACR**:
-  ```cmd
-  az containerapp update -g %RG% -n %APP% --image acrjacobsdigitalsolutionsada.azurecr.io/%IMAGE_REPO%:%IMAGE_TAG%
-  ```
-
-## 2) API key (no image rebuild)
-
-Create/update secret:
-
 ```cmd
-az containerapp secret set -g %RG% -n %APP% --secrets hitl-api-key=<strong_api_key>
+copy scripts\aca\aca.env.cmd.example scripts\aca\aca.env.cmd
 ```
 
-Bind env var to secret:
+Edit the file and set at minimum:
+- `ACR` — your Azure Container Registry name
+- `WORKLOAD_PROFILE` — GPU workload profile name (must exist in the managed environment)
+- `STG` — storage account name (lowercase letters/numbers only, 3-24 chars)
 
-```cmd
-az containerapp update -g %RG% -n %APP% --set-env-vars HITL_API_KEY=secretref:hitl-api-key
+### 2. One-time Azure Files setup
+
+Creates storage account, file share, registers with Container Apps environment, creates base directories.
+
+```bash
+source scripts/aca/aca.env.sh && bash scripts/aca/01_setup_once.sh
 ```
 
-## 3) Dashboard auth username/password (no image rebuild)
-
-The backend supports:
-- `HITL_DASHBOARD_USER`
-- `HITL_DASHBOARD_PASSWORD`
-
-Set username directly and password via secret (used on `/dashboard`):
-
 ```cmd
-az containerapp secret set -g %RG% -n %APP% --secrets hitl-dashboard-password=<strong_password>
-az containerapp update -g %RG% -n %APP% --set-env-vars HITL_DASHBOARD_USER=<dashboard_user> HITL_DASHBOARD_PASSWORD=secretref:hitl-dashboard-password HITL_ENABLE_DASHBOARD=true
+call scripts\aca\aca.env.cmd && call scripts\aca\01_setup_once.cmd
 ```
 
-If `HITL_DASHBOARD_PASSWORD` is unset but `HITL_API_KEY` is set, the backend falls back to using the API key as the dashboard basic-auth password.
+### 3. Upload model weights and data
 
-## 4) Dashboard exposure model
+Uploads `./data/` tree (models, projects, checkpoints) to Azure Files.
 
-Current default deploy exposes FastAPI ingress on `targetPort=8000`.
-Dashboard is mounted on the same app at:
-
-```text
-https://<FQDN>/dashboard
+```bash
+source scripts/aca/aca.env.sh && bash scripts/aca/02_upload_data.sh
 ```
 
-No ingress port switch is required for normal usage.
+```cmd
+call scripts\aca\aca.env.cmd && call scripts\aca\02_upload_data.cmd
+```
 
-If you want strict separation (separate public URL and scaling policy), deploy a second Container App for dashboard traffic.
-Use the same image, mount, and env, but a different `%APP%` name.
+If your data lives elsewhere, set `DATA_ROOT` in the env file.
 
-## 5) Quick verification
+### 4. Build and deploy
+
+Builds GPU Docker image in ACR, creates/updates the Container App.
+
+```bash
+source scripts/aca/aca.env.sh && bash scripts/aca/03_deploy.sh
+```
 
 ```cmd
-az containerapp show -g %RG% -n %APP% --query "properties.{provisioningState:provisioningState,runningStatus:runningStatus,latestRevision:latestRevisionName,latestReadyRevision:latestReadyRevisionName}" -o table
-az containerapp revision list -g %RG% -n %APP% -o table
+call scripts\aca\aca.env.cmd && call scripts\aca\03_deploy.cmd
+```
+
+### 5. Set API key and dashboard auth
+
+```bash
+az containerapp secret set -g $RG -n $APP \
+  --secrets hitl-api-key=<strong-key> hitl-dashboard-password=<strong-password>
+
+az containerapp update -g $RG -n $APP --set-env-vars \
+  HITL_API_KEY=secretref:hitl-api-key \
+  HITL_DASHBOARD_USER=admin \
+  HITL_DASHBOARD_PASSWORD=secretref:hitl-dashboard-password \
+  HITL_ENABLE_DASHBOARD=true
+```
+
+```cmd
+az containerapp secret set -g %RG% -n %APP% --secrets hitl-api-key=<strong-key> hitl-dashboard-password=<strong-password>
+az containerapp update -g %RG% -n %APP% --set-env-vars HITL_API_KEY=secretref:hitl-api-key HITL_DASHBOARD_USER=admin HITL_DASHBOARD_PASSWORD=secretref:hitl-dashboard-password HITL_ENABLE_DASHBOARD=true
+```
+
+If `HITL_DASHBOARD_PASSWORD` is unset but `HITL_API_KEY` is set, the backend falls back to using the API key as the dashboard password.
+
+### 6. Verify
+
+```bash
+FQDN=$(az containerapp show -g $RG -n $APP --query properties.configuration.ingress.fqdn -o tsv)
+curl -i https://$FQDN/health
+# Dashboard: https://$FQDN/dashboard
+```
+
+```cmd
 for /f "delims=" %i in ('az containerapp show -g %RG% -n %APP% --query properties.configuration.ingress.fqdn -o tsv') do @set FQDN=%i
 curl.exe --ssl-no-revoke -i https://%FQDN%/health
-curl.exe --ssl-no-revoke -I https://%FQDN%/dashboard
+REM Dashboard: https://%FQDN%/dashboard
 ```
 
-For startup/deploy issues:
+---
+
+## Redeployment (after code changes)
+
+### Code or dependency changes
+
+Rebuilds the Docker image and deploys:
+
+```bash
+source scripts/aca/aca.env.sh && bash scripts/aca/03_deploy.sh
+```
 
 ```cmd
-az containerapp logs show -g %RG% -n %APP% --type system --tail 100
-az containerapp logs show -g %RG% -n %APP% --tail 100
+call scripts\aca\aca.env.cmd && call scripts\aca\03_deploy.cmd
 ```
 
-## 6) Registry auth mode in `03_deploy.cmd`
+### Config/env changes only (no code change)
 
-- If `ACR_USERNAME` + `ACR_PASSWORD` are set in `aca.env.cmd`, deploy uses username/password registry auth.
-- If they are blank, deploy uses managed identity + `AcrPull` role path.
+Deploys without rebuilding:
+
+```bash
+source scripts/aca/aca.env.sh && bash scripts/aca/03_deploy.sh --skip-build
+```
+
+```cmd
+call scripts\aca\aca.env.cmd && call scripts\aca\03_deploy.cmd --skip-build
+```
+
+### Swap to an existing image tag
+
+```bash
+az containerapp update -g $RG -n $APP --image <acr-login-server>/$IMAGE_REPO:$IMAGE_TAG
+```
+
+```cmd
+az containerapp update -g %RG% -n %APP% --image <acr-login-server>/%IMAGE_REPO%:%IMAGE_TAG%
+```
+
+### Upload new data (model weights changed)
+
+```bash
+source scripts/aca/aca.env.sh && bash scripts/aca/02_upload_data.sh
+```
+
+```cmd
+call scripts\aca\aca.env.cmd && call scripts\aca\02_upload_data.cmd
+```
+
+Secrets and env vars persist across redeployments unless explicitly overwritten.
+
+---
+
+## Troubleshooting
+
+### Check app status
+
+```bash
+az containerapp show -g $RG -n $APP \
+  --query "properties.{state:provisioningState,revision:latestRevisionName}" -o table
+az containerapp revision list -g $RG -n $APP -o table
+```
+
+```cmd
+az containerapp show -g %RG% -n %APP% --query "properties.{state:provisioningState,revision:latestRevisionName}" -o table
+az containerapp revision list -g %RG% -n %APP% -o table
+```
+
+### View logs
+
+```bash
+az containerapp logs show -g $RG -n $APP --tail 100                # app logs
+az containerapp logs show -g $RG -n $APP --type system --tail 100  # system logs
+```
+
+```cmd
+az containerapp logs show -g %RG% -n %APP% --tail 100
+az containerapp logs show -g %RG% -n %APP% --type system --tail 100
+```
+
+### Registry auth
+
+- If `ACR_USERNAME` + `ACR_PASSWORD` are set in the env file, deploy uses username/password auth.
+- If blank, deploy uses managed identity + `AcrPull` role (recommended).
+
+---
+
+## Storage constraints
+
+GeoPackage uses SQLite which is single-writer. **`MAX_REPLICAS` must stay at `1`** — do not increase it or you will get `database is locked` errors. SQLite journal mode is set to `DELETE` (not WAL) for Azure Files SMB compatibility.

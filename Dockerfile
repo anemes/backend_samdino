@@ -19,11 +19,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip install --no-cache-dir "uv>=0.5.0"
 
+# --- Dependencies layer (cached unless pyproject.toml/uv.lock/sam3 change) ---
 COPY pyproject.toml uv.lock ./
 COPY vendor/sam3 ./vendor/sam3
-COPY hitl ./hitl
-COPY config ./config
-COPY scripts ./scripts
 
 RUN if [ "${CPU_TORCH_ONLY}" = "1" ]; then \
         uv sync --frozen --no-dev --no-install-package torch --no-install-package torchvision \
@@ -34,6 +32,11 @@ RUN if [ "${CPU_TORCH_ONLY}" = "1" ]; then \
 
 ENV PATH="/app/.venv/bin:${PATH}"
 
-EXPOSE 8000 7860
+# --- Application layer (rebuilds in seconds on code changes) ---
+COPY hitl ./hitl
+COPY config ./config
+COPY scripts ./scripts
+
+EXPOSE 8000
 
 CMD ["python", "-m", "hitl.app"]

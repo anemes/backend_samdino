@@ -650,17 +650,6 @@ def create_dashboard():
 
                     launch_msg = gr.Textbox(label="", interactive=False, lines=1)
 
-                    start_btn.click(
-                        start_training,
-                        inputs=[
-                            train_project, train_raster, train_xyz, train_zoom,
-                            train_epochs, train_bs, train_lr, train_wd,
-                            train_warmup, train_patience, train_freeze, train_amp,
-                        ],
-                        outputs=[launch_msg],
-                    )
-                    stop_btn.click(stop_training, outputs=[launch_msg])
-
                 # Right column: live metrics
                 with gr.Column(scale=1):
                     gr.Markdown("### Live Metrics")
@@ -687,11 +676,36 @@ def create_dashboard():
                         outputs=[live_status, per_class_box, dataset_box],
                     )
 
-                    # Auto-refresh every 5 seconds during training
-                    timer = gr.Timer(value=5)
+                    # Auto-refresh only while training is active
+                    timer = gr.Timer(value=10, active=False)
                     timer.tick(
                         poll_training,
                         outputs=[live_status, per_class_box, dataset_box],
+                    )
+
+                    def _start_and_enable_timer(*args):
+                        result = start_training(*args)
+                        is_running = "started" in result.lower() if isinstance(result, str) else False
+                        return result, gr.Timer(active=is_running)
+
+                    # Re-wire start button to also activate the timer
+                    start_btn.click(
+                        _start_and_enable_timer,
+                        inputs=[
+                            train_project, train_raster, train_xyz, train_zoom,
+                            train_epochs, train_bs, train_lr, train_wd,
+                            train_warmup, train_patience, train_freeze, train_amp,
+                        ],
+                        outputs=[launch_msg, timer],
+                    )
+
+                    def _stop_and_disable_timer():
+                        result = stop_training()
+                        return result, gr.Timer(active=False)
+
+                    stop_btn.click(
+                        _stop_and_disable_timer,
+                        outputs=[launch_msg, timer],
                     )
 
         # ==================== MODELS TAB ====================
