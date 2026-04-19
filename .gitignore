@@ -12,7 +12,7 @@ venv/
 env/
 
 # Runtime data and model weights (created/downloaded, not tracked)
-data/
+/data/
 
 # Temp files
 *.tif
