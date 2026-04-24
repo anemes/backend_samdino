@@ -306,8 +306,6 @@ tests/            Backend tests
 
 ## License
 
-This project is licensed under the **Creative Commons Attribution-NonCommercial 4.0 International License** (CC BY-NC-4.0). See [LICENSE](LICENSE) for the full text.
-
-You are free to use, modify, and share this software for non-commercial purposes with attribution. Commercial use requires separate permission.
+This project is licensed under the **GNU General Public License v2.0** (GPL-2.0). See [LICENSE](LICENSE) for the full text.
 
 **Dependency licenses**: SAM3 and DINOv3-sat are licensed under Apache 2.0 by Meta AI Research.
