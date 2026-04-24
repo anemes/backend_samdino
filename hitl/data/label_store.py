@@ -13,9 +13,11 @@ outside all regions is ignore_index.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
+import shutil
 import sqlite3
 import threading
 import time
@@ -77,10 +79,23 @@ class LabelStore:
     WRITE_RETRIES = 12
     WRITE_RETRY_DELAY_S = 0.25
 
-    def __init__(self, gpkg_path: str | Path):
-        self.path = Path(gpkg_path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._classes_path = self.path.parent / self.CLASSES_FILE
+    def __init__(self, gpkg_path: str | Path, local_cache_dir: str | Path | None = None):
+        self._remote_path = Path(gpkg_path)
+        self._remote_path.parent.mkdir(parents=True, exist_ok=True)
+        self._project_dir = self._remote_path.parent
+
+        if local_cache_dir and str(local_cache_dir).strip():
+            dir_hash = hashlib.md5(str(self._remote_path.parent).encode()).hexdigest()[:12]
+            local_dir = Path(local_cache_dir) / dir_hash
+            local_dir.mkdir(parents=True, exist_ok=True)
+            self.path = local_dir / self._remote_path.name
+            self._using_local_copy = True
+            self._pull_from_remote()
+        else:
+            self.path = self._remote_path
+            self._using_local_copy = False
+
+        self._classes_path = self._project_dir / self.CLASSES_FILE
         self._io_lock = _shared_path_lock(self.path)
         self._ensure_layers()
         self._set_sqlite_pragmas()
@@ -101,11 +116,42 @@ class LabelStore:
         except Exception:
             logger.warning("Could not set SQLite pragmas on %s", self.path, exc_info=True)
 
+    @property
+    def project_dir(self) -> Path:
+        """Remote project directory (for sidecar files: classes.json, sam_masks/)."""
+        return self._project_dir
+
+    def _pull_from_remote(self) -> None:
+        """Copy remote .gpkg to local cache (initial load)."""
+        if self._remote_path.exists():
+            shutil.copy2(self._remote_path, self.path)
+            logger.info("Pulled GeoPackage from remote: %s -> %s", self._remote_path, self.path)
+
+    def _push_to_remote(self) -> None:
+        """Copy local .gpkg back to remote storage after a write."""
+        if not self._using_local_copy:
+            return
+        try:
+            shutil.copy2(self.path, self._remote_path)
+            logger.debug("Pushed GeoPackage to remote: %s", self._remote_path)
+        except OSError:
+            logger.exception("Failed to push GeoPackage to remote: %s", self._remote_path)
+
+    def reload_from_remote(self) -> None:
+        """Re-pull the .gpkg from remote (e.g. after upload replaces it)."""
+        if self._using_local_copy:
+            self._pull_from_remote()
+        self._set_sqlite_pragmas()
+
     def _ensure_layers(self) -> None:
         """Create GeoPackage layers if they don't exist."""
         layers = set()
         if self.path.exists() and fiona is not None:
-            layers = set(fiona.listlayers(self.path))
+            try:
+                layers = set(fiona.listlayers(self.path))
+            except Exception:
+                logger.warning("Corrupt GeoPackage %s — recreating", self.path)
+                self.path.unlink(missing_ok=True)
         elif self.path.exists():
             # Best-effort fallback when fiona is unavailable.
             layers = {self.ANNOTATIONS_LAYER, self.REGIONS_LAYER}
@@ -159,6 +205,7 @@ class LabelStore:
                 schema=schema,
             ):
                 pass
+            self._push_to_remote()
 
     @staticmethod
     def _empty_annotations_gdf(crs: str) -> gpd.GeoDataFrame:
@@ -224,6 +271,7 @@ class LabelStore:
                         engine=self.IO_ENGINE,
                         index=False,
                     )
+                    self._push_to_remote()
                     return
                 except Exception as exc:
                     last_exc = exc

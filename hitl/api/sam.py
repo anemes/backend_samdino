@@ -199,7 +199,7 @@ def accept_mask(
     )
 
     # Save raw binary mask for pixel-perfect training data
-    masks_dir = Path(store.path).parent / "sam_masks"
+    masks_dir = store.project_dir / "sam_masks"
     masks_dir.mkdir(exist_ok=True)
     mask_path = masks_dir / f"ann_{idx:06d}.tif"
     try:

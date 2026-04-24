@@ -276,9 +276,11 @@ async def upload_labels(file: UploadFile = File(...), store=Depends(get_label_st
         shutil.copyfileobj(file.file, tmp)
         tmp_path = tmp.name
 
-    # Replace current labels
-    target = store.path
+    # Replace current labels (write to remote path if using local-copy mode)
+    target = store._remote_path if store._using_local_copy else store.path
     shutil.copy2(tmp_path, target)
     Path(tmp_path).unlink()
+    if store._using_local_copy:
+        store.reload_from_remote()
 
     return {"status": "ok", "path": str(target)}

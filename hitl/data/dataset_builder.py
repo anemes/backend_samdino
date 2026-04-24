@@ -244,7 +244,7 @@ class DatasetBuilder:
             return mask
 
         # Directory where SAM3 raw masks are stored (alongside labels.gpkg)
-        sam_masks_dir = self.label_store.path.parent / "sam_masks"
+        sam_masks_dir = self.label_store.project_dir / "sam_masks"
 
         # Separate annotations with raw masks from those needing polygon rasterization
         polygon_shapes = []

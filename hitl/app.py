@@ -84,7 +84,10 @@ class AppState:
                     logger.warning("Training thread did not stop within 10s")
 
         self.active_project_id = project_id
-        self.label_store = LabelStore(project_dir / "labels.gpkg")
+        self.label_store = LabelStore(
+            project_dir / "labels.gpkg",
+            local_cache_dir=self.config.paths.gpkg_cache_dir,
+        )
         self.registry = ModelRegistry(
             self.config.paths.checkpoint_dir, project_id=project_id
         )
@@ -125,7 +128,10 @@ async def lifespan(app: FastAPI):
         project_manager.create_project("default", "Default Project", "Auto-created default project")
 
     default_project_dir = project_manager.get_project_dir("default")
-    label_store = LabelStore(default_project_dir / "labels.gpkg")
+    label_store = LabelStore(
+        default_project_dir / "labels.gpkg",
+        local_cache_dir=config.paths.gpkg_cache_dir,
+    )
     registry = ModelRegistry(config.paths.checkpoint_dir, project_id="default")
     train_service = TrainService(config, gpu_manager, label_store, registry)
     inference_service = InferenceService(config, gpu_manager)
@@ -252,6 +258,27 @@ def create_app() -> FastAPI:
     @app.get("/health")
     def health():
         return {"status": "ok"}
+
+    # Authenticated status endpoint — used by plugin connect button
+    @app.get("/api/status")
+    def status():
+        gpu = app_state.gpu_manager
+        gpu_name = "none"
+        vram_total_mb = 0.0
+        vram_used_mb = 0.0
+        if gpu.device == "cuda":
+            import torch
+            props = torch.cuda.get_device_properties(0)
+            gpu_name = props.name
+            vram_total_mb = props.total_memory / (1024 * 1024)
+            vram_used_mb = gpu.vram_usage_mb()
+        return {
+            "status": "ok",
+            "gpu_active": gpu_name,
+            "gpu_vram_total_mb": vram_total_mb,
+            "gpu_vram_used_mb": vram_used_mb,
+            "project": app_state.active_project_id,
+        }
 
     return app
 

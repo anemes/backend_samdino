@@ -84,6 +84,7 @@ class PathsConfig(BaseModel):
     checkpoint_dir: str = "./checkpoints"
     dataset_cache_dir: str = "./dataset_cache"
     tile_cache_dir: str = "./tile_cache"
+    gpkg_cache_dir: str = ""  # local cache for GeoPackage; empty = disabled (direct I/O)
 
 
 class ServerConfig(BaseModel):
@@ -153,6 +154,10 @@ def load_config(path: str | Path = None) -> AppConfig:
         else:
             path = Path(__file__).parent / "default.yaml"
     _config = AppConfig.from_yaml(path)
+    # Allow env var override for gpkg_cache_dir (useful for ACA deployments)
+    gpkg_env = os.getenv("HITL_GPKG_CACHE_DIR")
+    if gpkg_env is not None:
+        object.__setattr__(_config.paths, "gpkg_cache_dir", gpkg_env)
     return _config
 
 

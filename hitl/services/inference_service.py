@@ -194,8 +194,12 @@ class InferenceService:
                 class_names = project_names
                 logger.info("Remapped class indices: %s", class_id_map)
 
-            # Export
-            output_dir = Path(self.config.paths.project_dir) / "predictions"
+            # Export — use local disk to avoid SQLite locking on Azure Files (SMB)
+            cache = self.config.paths.gpkg_cache_dir
+            if cache and str(cache).strip():
+                output_dir = Path(cache) / "predictions"
+            else:
+                output_dir = Path(self.config.paths.project_dir) / "predictions"
             result_paths = export_prediction(
                 class_map=class_map,
                 confidence_map=confidence_map,
