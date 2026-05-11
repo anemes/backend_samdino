@@ -249,14 +249,47 @@ Exempt: `GET /health`, `GET /docs`, `GET /openapi.json`.
 | Prefix | Description |
 |---|---|
 | `/api/projects/` | Create, list, switch, delete projects |
-| `/api/labels/` | Classes, regions, annotations, review workflow |
+| `/api/labels/` | Classes, regions, annotations, review workflow, promote inference results |
 | `/api/sam/` | Set image, send prompts, accept mask |
 | `/api/training/` | Start/stop training, poll status, training metrics |
-| `/api/inference/` | Start inference, poll status, download results |
-| `/api/models/` | List checkpoints, get best model |
+| `/api/inference/` | Start inference (path or upload), poll status, download results |
+| `/api/models/` | List checkpoints, best model, `GET /catalogue` (cross-project + global) |
 | `/api/raster/` | Register XYZ tile sources |
 | `/api/dataset/` | Build training dataset, label stats |
 | `/api/status` | GPU info, VRAM usage, active project |
+
+### Reserved projects
+
+The server auto-creates a `_inference` project at startup alongside `default`. It behaves like any other project (same `LabelStore` / GeoPackage), with two differences:
+
+- The training service is **never started** for it — it is not a training project.
+- Its class list accumulates organically from checkpoint class names as different models are used in standalone inference. No user management required.
+
+Standalone inference results are auto-promoted into `_inference` by the QGIS plugin after each successful run and survive backend restarts.
+
+### Global model registry
+
+Pre-trained or externally sourced models can be registered globally so that all projects in the standalone inference catalogue can use them, without being tied to any training run.
+
+Place a file at `data/models/global/registry.json`:
+
+```json
+[
+  {
+    "run_id": "building-detector-v1",
+    "checkpoint_path": "/app/data/models/global/building_v1.pt",
+    "class_names": ["ignore", "background", "building"],
+    "num_classes": 3,
+    "display_name": "Building Detector v1 (pre-trained)",
+    "best_val_mIoU": 0.87
+  }
+]
+```
+
+Required fields: `run_id`, `checkpoint_path`, `class_names`, `num_classes`.
+Optional fields: `display_name`, `best_val_mIoU`.
+
+These entries appear in `GET /api/models/catalogue` with `"source": "global"` alongside project-trained checkpoints.
 
 ---
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from .deps import require_active_project_contributor
+
 router = APIRouter()
 
 
@@ -19,7 +21,7 @@ def get_deps():
 
 
 @router.post("/build")
-def build_dataset(req: BuildRequest, state=Depends(get_deps)):
+def build_dataset(req: BuildRequest, state=Depends(get_deps), _user=Depends(require_active_project_contributor)):
     """Build a tiled dataset from current labels + raster source."""
     from ..data.raster_source import GeoTIFFSource
     from ..data.dataset_builder import DatasetBuilder

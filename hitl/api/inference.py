@@ -8,11 +8,12 @@ import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from ..data.label_store import SegClass
+from .deps import get_current_user, resolve_project_role
 
 logger = logging.getLogger(__name__)
 
@@ -24,14 +25,64 @@ class PredictRequest(BaseModel):
     xyz_url: Optional[str] = None  # XYZ tile URL template (alternative to raster_path)
     xyz_zoom: int = 18  # zoom level for XYZ source
     aoi_bounds: List[float]  # [minx, miny, maxx, maxy]
-    project_id: str = "default"
+    project_id: str = "default"  # target project for class resolution / result metadata
     checkpoint_run_id: Optional[str] = None  # which model run to use
+    checkpoint_project_id: Optional[str] = None  # project that owns the checkpoint (cross-project)
     checkpoint_type: str = "best"  # "best" or "latest"
 
 
 def get_deps():
     from ..app import app_state
     return app_state
+
+
+def _resolve_inference_project(project_id: str, user: dict) -> str:
+    """Rewrite the legacy '_inference' sentinel to the per-user project id."""
+    if project_id == "_inference":
+        return f"_inference_{user['user_id']}"
+    return project_id
+
+
+def _open_label_store(state, project_id: str, user: dict, auto_create: bool = False):
+    """Open a LabelStore for *project_id* without switching the active project.
+
+    - Returns the shared store when project_id matches the active project.
+    - For _inference_* projects, auto-creates on first access when auto_create=True.
+    - For all other projects, enforces visibility: 404 if the caller has no role.
+    """
+    if project_id == state.active_project_id:
+        return state.label_store
+    from ..data.label_store import LabelStore
+    pm = state.project_manager
+    project_dir = pm.get_project_dir(project_id)
+    if not project_dir.exists():
+        if auto_create and project_id.startswith("_inference"):
+            pm.create_project(project_id, project_id, owner=user["user_id"])
+        else:
+            raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    else:
+        # Visibility check for non-inference projects
+        if not project_id.startswith("_inference"):
+            info = pm.get_project(project_id)
+            if info is not None and resolve_project_role(user, info) is None:
+                raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    return LabelStore(
+        project_dir / "labels.gpkg",
+        local_cache_dir=state.config.paths.gpkg_cache_dir,
+    )
+
+
+def _open_registry(state, project_id: str, user: dict):
+    """Open a ModelRegistry for the given project_id with visibility check."""
+    from ..models.registry import ModelRegistry
+    if project_id == state.active_project_id:
+        return state.registry
+    if not project_id.startswith("_inference"):
+        pm = state.project_manager
+        info = pm.get_project(project_id)
+        if info is not None and resolve_project_role(user, info) is None:
+            raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    return ModelRegistry(state.config.paths.checkpoint_dir, project_id=project_id)
 
 
 def _resolve_checkpoint_classes(
@@ -113,12 +164,17 @@ def _resolve_checkpoint_classes(
 
 
 @router.post("/predict")
-def start_prediction(req: PredictRequest, state=Depends(get_deps)):
+def start_prediction(req: PredictRequest, request: Request, state=Depends(get_deps)):
     """Start tiled inference on an AOI."""
     from ..data.raster_source import GeoTIFFSource
 
     if state.inference_service.is_running:
         raise HTTPException(status_code=409, detail="Inference already in progress")
+
+    user = get_current_user(request)
+
+    # Rewrite '_inference' sentinel to per-user project id
+    effective_project_id = _resolve_inference_project(req.project_id, user)
 
     if req.xyz_url:
         from ..data.raster_source import XYZTileSource
@@ -132,31 +188,37 @@ def start_prediction(req: PredictRequest, state=Depends(get_deps)):
     else:
         raise HTTPException(status_code=400, detail="Provide raster_path or xyz_url")
 
-    user_classes = list(state.label_store.get_classes())
+    # Resolve label store for the target project (class resolution + auto-add)
+    label_store = _open_label_store(state, effective_project_id, user, auto_create=True)
+    user_classes = list(label_store.get_classes())
+
+    # Resolve checkpoint registry (may be from a different project)
+    ckpt_project = req.checkpoint_project_id or state.active_project_id
+    registry = _open_registry(state, ckpt_project, user)
 
     # Resolve checkpoint
     checkpoint_record = None
     checkpoint_path = None
     if req.checkpoint_run_id:
-        checkpoint_path = state.registry.get_checkpoint_path(
+        checkpoint_path = registry.get_checkpoint_path(
             req.checkpoint_run_id, req.checkpoint_type
         )
         if checkpoint_path is None:
             raise HTTPException(status_code=404, detail="Checkpoint not found")
         checkpoint_path = str(checkpoint_path)
-        # Find matching record for metadata
-        for rec in state.registry.list_checkpoints():
-            if rec.get("checkpoint_path") == checkpoint_path:
-                checkpoint_record = rec
-                break
+        # Look up record by run_id — path comparison is unreliable when data has
+        # moved between environments (local → Docker → ACA changes the base dir).
+        checkpoint_record = registry.get_checkpoint_record(
+            req.checkpoint_run_id, req.checkpoint_type
+        )
     else:
-        checkpoint_record = state.registry.get_best_checkpoint()
+        checkpoint_record = registry.get_best_checkpoint()
         if checkpoint_record:
             checkpoint_path = checkpoint_record.get("checkpoint_path")
 
-    # Match checkpoint classes to project classes
+    # Match checkpoint classes to target project's classes
     num_classes, class_names, class_id_map, warnings = _resolve_checkpoint_classes(
-        checkpoint_record, user_classes, state.label_store,
+        checkpoint_record, user_classes, label_store,
     )
 
     job_id = state.inference_service.start_inference(
@@ -165,7 +227,7 @@ def start_prediction(req: PredictRequest, state=Depends(get_deps)):
         num_classes=num_classes,
         class_names=class_names,
         checkpoint_path=checkpoint_path,
-        project_id=req.project_id,
+        project_id=effective_project_id,
         class_id_map=class_id_map,
     )
     return {"job_id": job_id, "status": "started", "warnings": warnings}
@@ -173,10 +235,12 @@ def start_prediction(req: PredictRequest, state=Depends(get_deps)):
 
 @router.post("/predict-upload")
 async def start_prediction_upload(
+    request: Request,
     file: UploadFile = File(...),
     aoi_bounds: str = Form(...),  # JSON string: "[minx, miny, maxx, maxy]"
     project_id: str = Form("default"),
     checkpoint_run_id: Optional[str] = Form(None),
+    checkpoint_project_id: Optional[str] = Form(None),  # source project for cross-project checkpoints
     checkpoint_type: str = Form("best"),
     state=Depends(get_deps),
 ):
@@ -189,6 +253,11 @@ async def start_prediction_upload(
 
     if state.inference_service.is_running:
         raise HTTPException(status_code=409, detail="Inference already in progress")
+
+    user = get_current_user(request)
+
+    # Rewrite '_inference' sentinel to per-user project id
+    effective_project_id = _resolve_inference_project(project_id, user)
 
     # Parse AOI bounds from JSON string
     try:
@@ -208,30 +277,35 @@ async def start_prediction_upload(
 
     raster_source = GeoTIFFSource(str(upload_path))
 
-    user_classes = list(state.label_store.get_classes())
+    # Resolve label store for the target project
+    label_store = _open_label_store(state, effective_project_id, user, auto_create=True)
+    user_classes = list(label_store.get_classes())
+
+    # Resolve checkpoint registry (may be from a different project)
+    ckpt_project = checkpoint_project_id or state.active_project_id
+    registry = _open_registry(state, ckpt_project, user)
 
     # Resolve checkpoint
     checkpoint_record = None
     checkpoint_path = None
     if checkpoint_run_id:
-        checkpoint_path = state.registry.get_checkpoint_path(
+        checkpoint_path = registry.get_checkpoint_path(
             checkpoint_run_id, checkpoint_type
         )
         if checkpoint_path is None:
             raise HTTPException(status_code=404, detail="Checkpoint not found")
         checkpoint_path = str(checkpoint_path)
-        for rec in state.registry.list_checkpoints():
-            if rec.get("checkpoint_path") == checkpoint_path:
-                checkpoint_record = rec
-                break
+        checkpoint_record = registry.get_checkpoint_record(
+            checkpoint_run_id, checkpoint_type
+        )
     else:
-        checkpoint_record = state.registry.get_best_checkpoint()
+        checkpoint_record = registry.get_best_checkpoint()
         if checkpoint_record:
             checkpoint_path = checkpoint_record.get("checkpoint_path")
 
-    # Match checkpoint classes to project classes
+    # Match checkpoint classes to target project's classes
     num_classes, class_names, class_id_map, warnings = _resolve_checkpoint_classes(
-        checkpoint_record, user_classes, state.label_store,
+        checkpoint_record, user_classes, label_store,
     )
 
     job_id = state.inference_service.start_inference(
@@ -240,7 +314,7 @@ async def start_prediction_upload(
         num_classes=num_classes,
         class_names=class_names,
         checkpoint_path=checkpoint_path,
-        project_id=project_id,
+        project_id=effective_project_id,
         class_id_map=class_id_map,
     )
     return {"job_id": job_id, "status": "started", "warnings": warnings}

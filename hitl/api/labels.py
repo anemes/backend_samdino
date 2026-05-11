@@ -6,8 +6,10 @@ import logging
 import math
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
 from pydantic import BaseModel
+
+from .deps import get_current_user, require_active_project_contributor
 
 logger = logging.getLogger(__name__)
 
@@ -57,10 +59,15 @@ class RegionRequest(BaseModel):
     crs: str = "EPSG:4326"
 
 
-# --- Dependency ---
+# --- Dependencies ---
 def get_label_store():
     from ..app import app_state
     return app_state.label_store
+
+
+def get_state():
+    from ..app import app_state
+    return app_state
 
 
 # --- Classes ---
@@ -72,7 +79,7 @@ def get_classes(store=Depends(get_label_store)):
 
 
 @router.post("/classes")
-def set_classes(req: ClassesRequest, store=Depends(get_label_store)):
+def set_classes(req: ClassesRequest, store=Depends(get_label_store), _user=Depends(require_active_project_contributor)):
     from ..data.label_store import SegClass
     classes = [SegClass(class_id=c.class_id, name=c.name, color=c.color) for c in req.classes]
     store.set_classes(classes)
@@ -96,7 +103,7 @@ def get_regions(crs: str = "EPSG:4326", store=Depends(get_label_store)):
 
 
 @router.post("/regions")
-def add_region(req: RegionRequest, store=Depends(get_label_store)):
+def add_region(req: RegionRequest, store=Depends(get_label_store), _user=Depends(require_active_project_contributor)):
     region_id = store.add_region(req.geometry_geojson, crs=req.crs)
     return {"region_id": region_id}
 
@@ -125,7 +132,7 @@ def get_annotations(
 
 
 @router.post("/annotations")
-def add_annotation(req: AnnotationRequest, store=Depends(get_label_store)):
+def add_annotation(req: AnnotationRequest, store=Depends(get_label_store), _user=Depends(require_active_project_contributor)):
     if req.class_id < 2:
         raise HTTPException(
             status_code=400,
@@ -156,7 +163,7 @@ def add_annotation(req: AnnotationRequest, store=Depends(get_label_store)):
 
 
 @router.delete("/annotations/{annotation_index}")
-def delete_annotation(annotation_index: int, store=Depends(get_label_store)):
+def delete_annotation(annotation_index: int, store=Depends(get_label_store), _user=Depends(require_active_project_contributor)):
     ok = store.delete_annotation(annotation_index)
     if not ok:
         raise HTTPException(status_code=404, detail="Annotation not found")
@@ -164,13 +171,13 @@ def delete_annotation(annotation_index: int, store=Depends(get_label_store)):
 
 
 @router.delete("/regions/{region_id}")
-def delete_region(region_id: int, store=Depends(get_label_store)):
+def delete_region(region_id: int, store=Depends(get_label_store), _user=Depends(require_active_project_contributor)):
     deleted = store.delete_region(region_id)
     return {"status": "ok", "annotations_deleted": deleted}
 
 
 @router.delete("/annotations/region/{region_id}")
-def delete_region_annotations(region_id: int, store=Depends(get_label_store)):
+def delete_region_annotations(region_id: int, store=Depends(get_label_store), _user=Depends(require_active_project_contributor)):
     deleted = store.delete_annotations_in_region(region_id)
     return {"deleted": deleted}
 
@@ -181,20 +188,27 @@ def delete_region_annotations(region_id: int, store=Depends(get_label_store)):
 class PromoteInferenceRequest(BaseModel):
     aoi_geojson: dict  # Full AOI polygon GeoJSON geometry
     job_id: str  # Inference job ID to promote from
+    project_id: Optional[str] = None  # target project; None = currently active project
 
 
 @router.post("/promote-inference")
-def promote_inference(req: PromoteInferenceRequest, store=Depends(get_label_store)):
+def promote_inference(req: PromoteInferenceRequest, request: Request, state=Depends(get_state)):
     """Promote inference results to in-review annotations.
 
-    Creates a region (status='in_review') from the AOI polygon, then
-    reads the prediction GeoPackage and inserts all non-background polygons
-    as annotations (status='in_review').
+    Creates a region (status='in_review') from the AOI polygon, then reads the
+    prediction GeoPackage and inserts all non-background polygons as annotations
+    (status='in_review').
+
+    When *project_id* is supplied (e.g. '_inference' for standalone inference),
+    the results are written to that project's GeoPackage without switching the
+    globally active project.
     """
     import geopandas as gpd
-    from ..app import app_state
+    from shapely import wkt as shapely_wkt
 
-    inf_state = app_state.inference_service.state
+    user = get_current_user(request)
+
+    inf_state = state.inference_service.state
     if inf_state.job_id != req.job_id:
         raise HTTPException(status_code=404, detail=f"Job '{req.job_id}' not found")
     if inf_state.status != "complete":
@@ -205,6 +219,27 @@ def promote_inference(req: PromoteInferenceRequest, store=Depends(get_label_stor
     vec_path = inf_state.result_paths.get("vector")
     if not vec_path:
         raise HTTPException(status_code=404, detail="No vector results for this job")
+
+    # Resolve target project, rewriting the legacy '_inference' sentinel
+    target_project = req.project_id or state.active_project_id
+    if target_project == "_inference":
+        target_project = f"_inference_{user['user_id']}"
+
+    if target_project == state.active_project_id:
+        store = state.label_store
+    else:
+        from ..data.label_store import LabelStore
+        pm = state.project_manager
+        project_dir = pm.get_project_dir(target_project)
+        if not project_dir.exists():
+            if target_project.startswith("_inference"):
+                pm.create_project(target_project, target_project, owner=user["user_id"])
+            else:
+                raise HTTPException(status_code=404, detail=f"Project '{target_project}' not found")
+        store = LabelStore(
+            project_dir / "labels.gpkg",
+            local_cache_dir=state.config.paths.gpkg_cache_dir,
+        )
 
     # Create the review region from AOI polygon
     region_id = store.add_region(req.aoi_geojson, crs="EPSG:4326", status="in_review")
@@ -227,8 +262,6 @@ def promote_inference(req: PromoteInferenceRequest, store=Depends(get_label_stor
         }
 
     # Round coordinates to 6 decimal places to avoid WKT parser overflow
-    from shapely import wkt as shapely_wkt
-
     pred_gdf["geometry"] = pred_gdf["geometry"].apply(
         lambda g: shapely_wkt.loads(shapely_wkt.dumps(g, rounding_precision=6))
     )
@@ -243,14 +276,14 @@ def promote_inference(req: PromoteInferenceRequest, store=Depends(get_label_stor
     )
 
     logger.info(
-        "Promoted inference job %s: region %d, %d annotations",
-        req.job_id, region_id, count,
+        "Promoted inference job %s → project '%s': region %d, %d annotations",
+        req.job_id, target_project, region_id, count,
     )
-    return {"region_id": region_id, "annotations_created": count}
+    return {"region_id": region_id, "annotations_created": count, "project_id": target_project}
 
 
 @router.post("/regions/{region_id}/approve")
-def approve_region(region_id: int, store=Depends(get_label_store)):
+def approve_region(region_id: int, store=Depends(get_label_store), _user=Depends(require_active_project_contributor)):
     """Approve an in-review region and all its annotations for training."""
     try:
         count = store.approve_region(region_id)
@@ -265,7 +298,7 @@ def get_stats(store=Depends(get_label_store)):
 
 
 @router.post("/upload")
-async def upload_labels(file: UploadFile = File(...), store=Depends(get_label_store)):
+async def upload_labels(file: UploadFile = File(...), store=Depends(get_label_store), _user=Depends(require_active_project_contributor)):
     """Upload a GeoPackage file to replace the current labels."""
     import shutil
     import tempfile

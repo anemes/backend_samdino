@@ -22,6 +22,8 @@ import numpy as np
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
+from .deps import require_active_project_contributor
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -71,6 +73,7 @@ def get_label_store():
 async def set_image(
     file: UploadFile = File(...),
     sam=Depends(get_sam_service),
+    _user=Depends(require_active_project_contributor),
 ):
     """Upload an image and start a SAM3 session.
 
@@ -150,6 +153,7 @@ def accept_mask(
     req: AcceptRequest,
     sam=Depends(get_sam_service),
     store=Depends(get_label_store),
+    _user=Depends(require_active_project_contributor),
 ):
     """Accept the current SAM3 mask and save it as an annotation.
 
@@ -229,7 +233,7 @@ def get_session(sam=Depends(get_sam_service)):
 
 
 @router.post("/reset")
-def reset_session(sam=Depends(get_sam_service)):
+def reset_session(sam=Depends(get_sam_service), _user=Depends(require_active_project_contributor)):
     """Clear the current SAM3 session."""
     sam.reset()
     return {"status": "ok"}

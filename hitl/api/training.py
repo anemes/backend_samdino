@@ -7,6 +7,8 @@ from typing import Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from .deps import require_active_project_contributor
+
 router = APIRouter()
 
 
@@ -32,7 +34,7 @@ def get_deps():
 
 
 @router.post("/start")
-def start_training(req: TrainRequest, state=Depends(get_deps)):
+def start_training(req: TrainRequest, state=Depends(get_deps), _user=Depends(require_active_project_contributor)):
     """Start training in background."""
     if state.train_service.is_running:
         raise HTTPException(status_code=409, detail="Training already in progress")
@@ -72,7 +74,7 @@ def start_training(req: TrainRequest, state=Depends(get_deps)):
 
 
 @router.post("/stop")
-def stop_training(state=Depends(get_deps)):
+def stop_training(state=Depends(get_deps), _user=Depends(require_active_project_contributor)):
     """Stop training early."""
     state.train_service.stop_training()
     return {"status": "stopping"}

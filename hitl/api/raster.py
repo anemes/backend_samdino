@@ -11,6 +11,8 @@ from typing import Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from .deps import require_active_project_contributor
+
 router = APIRouter()
 
 
@@ -42,7 +44,7 @@ def get_deps():
 
 
 @router.post("/register-xyz")
-def register_xyz(req: RegisterXYZRequest, state=Depends(get_deps)):
+def register_xyz(req: RegisterXYZRequest, state=Depends(get_deps), _user=Depends(require_active_project_contributor)):
     """Register an XYZ tile service as a raster source."""
     global _next_id
     source_id = f"xyz_{_next_id}"
@@ -95,7 +97,7 @@ def get_source(source_id: str):
 
 
 @router.delete("/sources/{source_id}")
-def delete_source(source_id: str):
+def delete_source(source_id: str, _user=Depends(require_active_project_contributor)):
     """Remove a registered raster source."""
     if source_id not in _sources:
         raise HTTPException(status_code=404, detail="Source not found")

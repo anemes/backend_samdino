@@ -146,6 +146,25 @@ class ModelRegistry:
         p = self.root / f"run_{run_id}" / f"{which}.pt"
         return p if p.exists() else None
 
+    def get_checkpoint_record(self, run_id: str, which: str = "best") -> Optional[dict]:
+        """Get the registry record for a specific run and checkpoint type.
+
+        Looks up by run_id (not stored path), so it works even when the data
+        directory has moved between environments (local → Docker → ACA).
+        Prefers the record whose stored path contains *which* ('best'/'latest').
+        Falls back to any record for the run if no type-specific match is found.
+        """
+        records = self._load_json(self._registry_path)
+        fallback = None
+        for rec in records:
+            if rec.get("run_id") != run_id:
+                continue
+            if which in rec.get("checkpoint_path", ""):
+                return rec
+            if fallback is None:
+                fallback = rec
+        return fallback
+
     def list_runs(self) -> List[str]:
         """List distinct run_ids that have checkpoints."""
         records = self._load_json(self._registry_path)

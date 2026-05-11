@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -123,9 +124,18 @@ async def lifespan(app: FastAPI):
     # Project manager
     project_manager = ProjectManager(config.paths.project_dir)
 
-    # Ensure a "default" project exists
+    # Ensure reserved projects exist
     if project_manager.get_project("default") is None:
-        project_manager.create_project("default", "Default Project", "Auto-created default project")
+        project_manager.create_project("default", "Default Project", "Auto-created default project", owner="_system")
+    # Per-user _inference_{user_id} projects are created lazily on first inference.
+    # Create _inference_default for the legacy single-key deployment.
+    if project_manager.get_project("_inference_default") is None:
+        project_manager.create_project(
+            "_inference_default",
+            "Standalone Inference (default user)",
+            "Reserved project for standalone inference results (not used for training)",
+            owner="_system",
+        )
 
     default_project_dir = project_manager.get_project_dir("default")
     label_store = LabelStore(
@@ -184,8 +194,31 @@ def create_app() -> FastAPI:
     from config.schema import get_config
 
     _config = get_config()
-    _api_key = os.getenv("HITL_API_KEY") or _config.server.api_key
     _dashboard_has_basic_auth = False
+
+    # --- Key registry ---
+    # data/keys.json (sibling of projects/) takes priority over HITL_API_KEY.
+    # Format: [{"key": "sk-...", "user_id": "alice", "label": "Alice", "admin": false}, ...]
+    # Fallback: HITL_API_KEY env var → single admin key for user_id="default".
+    def _load_key_registry() -> dict:
+        keys_path = Path(_config.paths.project_dir).parent / "keys.json"
+        if keys_path.exists():
+            try:
+                entries = json.loads(keys_path.read_text())
+                return {
+                    e["key"]: {**e, "is_admin": bool(e.get("admin", False))}
+                    for e in entries
+                    if "key" in e and "user_id" in e
+                }
+            except Exception:
+                logger.exception("Failed to load keys.json at %s", keys_path)
+        api_key = os.getenv("HITL_API_KEY") or getattr(_config.server, "api_key", None)
+        if api_key:
+            return {api_key: {"key": api_key, "user_id": "default", "label": "Default", "is_admin": True}}
+        return {}  # open API — all requests pass through unauthenticated
+
+    _key_registry = _load_key_registry()
+    _api_key = next(iter(_key_registry)) if len(_key_registry) == 1 else None  # legacy compat for dashboard
 
     # Mount dashboard under the same FastAPI app/port unless explicitly disabled.
     dashboard_enabled = _env_bool("HITL_ENABLE_DASHBOARD", True)
@@ -230,8 +263,12 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
         path = request.url.path
-        if not _api_key:
+        # Open API (no keys configured) — set default identity and pass through
+        if not _key_registry:
+            request.state.user_id = "default"
+            request.state.is_admin = True
             return await call_next(request)
+        # Unauthenticated paths
         if path in ("/health", "/docs", "/openapi.json"):
             return await call_next(request)
         if _dashboard_has_basic_auth and (
@@ -243,11 +280,20 @@ def create_app() -> FastAPI:
             or path == "/favicon.ico"
         ):
             return await call_next(request)
+        # Validate bearer token and inject identity
         auth = request.headers.get("Authorization", "")
-        if auth != f"Bearer {_api_key}":
+        if not auth.startswith("Bearer "):
             return JSONResponse(
                 status_code=401, content={"detail": "Invalid or missing API key"}
             )
+        token = auth[7:]
+        entry = _key_registry.get(token)
+        if entry is None:
+            return JSONResponse(
+                status_code=401, content={"detail": "Invalid or missing API key"}
+            )
+        request.state.user_id = entry["user_id"]
+        request.state.is_admin = entry.get("is_admin", False)
         return await call_next(request)
 
     # Mount API routes
@@ -261,7 +307,7 @@ def create_app() -> FastAPI:
 
     # Authenticated status endpoint — used by plugin connect button
     @app.get("/api/status")
-    def status():
+    def status(request: Request):
         gpu = app_state.gpu_manager
         gpu_name = "none"
         vram_total_mb = 0.0
@@ -274,6 +320,8 @@ def create_app() -> FastAPI:
             vram_used_mb = gpu.vram_usage_mb()
         return {
             "status": "ok",
+            "user_id": getattr(request.state, "user_id", "default"),
+            "is_admin": getattr(request.state, "is_admin", True),
             "gpu_active": gpu_name,
             "gpu_vram_total_mb": vram_total_mb,
             "gpu_vram_used_mb": vram_used_mb,
