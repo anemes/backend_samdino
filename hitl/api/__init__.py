@@ -2,9 +2,10 @@
 
 from fastapi import APIRouter
 
-from . import dataset, inference, labels, models, preview, projects, raster, sam, training
+from . import dataset, inference, labels, models, preview, projects, raster, sam, session, training
 
 router = APIRouter(prefix="/api")
+router.include_router(session.router, prefix="/session", tags=["session"])
 router.include_router(projects.router, prefix="/projects", tags=["projects"])
 router.include_router(labels.router, prefix="/labels", tags=["labels"])
 router.include_router(dataset.router, prefix="/dataset", tags=["dataset"])

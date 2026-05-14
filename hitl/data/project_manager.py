@@ -10,11 +10,28 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
+
+# Allow only alphanumeric, hyphen, underscore, and dot — no path separators or
+# traversal sequences.  Starts with alphanumeric to prevent hidden-file abuse.
+_PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def validate_project_id(project_id: str) -> None:
+    """Raise ValueError if project_id is not safe for use as a directory name."""
+    if not _PROJECT_ID_RE.match(project_id):
+        raise ValueError(
+            f"Invalid project_id {project_id!r}. "
+            "Must be 1–64 characters, start with alphanumeric, and contain only "
+            "letters, digits, hyphens, underscores, or dots."
+        )
+    if project_id in (".", ".."):
+        raise ValueError(f"Reserved project_id: {project_id!r}")
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +78,7 @@ class ProjectManager:
         owner: str = "_system",
     ) -> ProjectInfo:
         """Create a new project directory."""
+        validate_project_id(project_id)
         project_dir = self.projects_dir / project_id
         if project_dir.exists():
             raise ValueError(f"Project '{project_id}' already exists")
@@ -104,7 +122,14 @@ class ProjectManager:
         return [d.name for d in sorted(self.projects_dir.iterdir()) if d.is_dir()]
 
     def get_project_dir(self, project_id: str) -> Path:
-        """Get the directory path for a project."""
+        """Get the directory path for a project.
+
+        Raises ValueError if project_id would escape the projects root.
+        """
+        candidate = (self.projects_dir / project_id).resolve()
+        root = self.projects_dir.resolve()
+        if not str(candidate).startswith(str(root)):
+            raise ValueError(f"project_id {project_id!r} escapes the projects directory")
         return self.projects_dir / project_id
 
     def set_project_info(self, project_id: str, **updates) -> Optional[ProjectInfo]:

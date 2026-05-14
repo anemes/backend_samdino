@@ -328,6 +328,17 @@ class SAMService:
         logger.info("Saved raw SAM mask to %s (%dx%d, class_id=%d)",
                      output_path, mask_data.shape[1], mask_data.shape[0], class_id)
 
+    def reset_prompts(self) -> None:
+        """Clear accumulated prompts on the current session, keeping the image loaded."""
+        if self._session is None:
+            return
+        session = self._session
+        session.point_coords = []
+        session.point_labels = []
+        session.box = None
+        session.current_mask = None
+        session.current_score = 0.0
+
     def reset(self) -> None:
         """Clear the current session (keeps SAM3 model loaded)."""
         if self._session is not None:

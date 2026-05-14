@@ -5,10 +5,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
+import threading
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+# How long an idle session is kept before auto-release (seconds).
+SESSION_IDLE_TIMEOUT_S = 1800
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,6 +50,16 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 @dataclass
+class InstanceSession:
+    """Exclusive-access session held by one user at a time."""
+
+    user_id: str
+    token: str
+    acquired_at: datetime
+    last_heartbeat: datetime
+
+
+@dataclass
 class AppState:
     """Shared application state across all endpoints."""
 
@@ -56,12 +72,76 @@ class AppState:
     sam_service: SAMService
     project_manager: Optional["ProjectManager"] = None
     active_project_id: Optional[str] = None
+    # Protects multi-field project switch from concurrent readers seeing
+    # a partially-updated state (e.g. new label_store with old registry).
+    _switch_lock: threading.Lock = None  # type: ignore[assignment]
+    # Exclusive instance session (one user at a time).
+    _instance_session: Optional[InstanceSession] = None
+    _session_mutex: threading.Lock = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        self._switch_lock = threading.Lock()
+        self._session_mutex = threading.Lock()
+
+    # --- Session management ---
+
+    def acquire_session(self, user_id: str) -> Optional[str]:
+        """Try to acquire exclusive session. Returns token on success, None if held."""
+        with self._session_mutex:
+            now = datetime.now()
+            # Auto-expire idle sessions before checking.
+            if self._instance_session is not None:
+                idle = (now - self._instance_session.last_heartbeat).total_seconds()
+                if idle > SESSION_IDLE_TIMEOUT_S:
+                    logger.info(
+                        "Session held by '%s' expired after %.0fs idle — auto-releasing",
+                        self._instance_session.user_id,
+                        idle,
+                    )
+                    self._instance_session = None
+            # Re-entrant: same user refreshes their token.
+            if self._instance_session is not None and self._instance_session.user_id == user_id:
+                self._instance_session.last_heartbeat = now
+                return self._instance_session.token
+            # Already held by someone else.
+            if self._instance_session is not None:
+                return None
+            token = secrets.token_urlsafe(32)
+            self._instance_session = InstanceSession(
+                user_id=user_id, token=token, acquired_at=now, last_heartbeat=now
+            )
+            logger.info("Session acquired by '%s'", user_id)
+            return token
+
+    def release_session(self, token: Optional[str] = None, force: bool = False) -> bool:
+        """Release the session. Returns True if released, False if token mismatch."""
+        with self._session_mutex:
+            if self._instance_session is None:
+                return True
+            if force or token == self._instance_session.token:
+                logger.info(
+                    "Session released (user='%s', force=%s)",
+                    self._instance_session.user_id,
+                    force,
+                )
+                self._instance_session = None
+                return True
+            return False
+
+    def heartbeat_session(self, token: str) -> bool:
+        """Refresh the session heartbeat. Returns False if token is invalid/expired."""
+        with self._session_mutex:
+            if self._instance_session is None or self._instance_session.token != token:
+                return False
+            self._instance_session.last_heartbeat = datetime.now()
+            return True
 
     def switch_project(self, project_id: str) -> None:
         """Switch to a different project, updating label_store and registry.
 
-        Stops any running training before switching to prevent orphaned
-        threads and GPU memory leaks.
+        Stops any running training or inference before switching to prevent
+        orphaned threads and GPU memory leaks.  All field updates happen under
+        a lock so concurrent requests never see a partially-switched state.
         """
         pm = self.project_manager
         if pm is None:
@@ -78,23 +158,31 @@ class AppState:
                 self.active_project_id,
             )
             self.train_service.stop_training()
-            # Wait for the training thread to finish (up to 10s)
             if self.train_service._thread is not None:
                 self.train_service._thread.join(timeout=10)
                 if self.train_service._thread.is_alive():
                     logger.warning("Training thread did not stop within 10s")
 
-        self.active_project_id = project_id
-        self.label_store = LabelStore(
-            project_dir / "labels.gpkg",
-            local_cache_dir=self.config.paths.gpkg_cache_dir,
-        )
-        self.registry = ModelRegistry(
-            self.config.paths.checkpoint_dir, project_id=project_id
-        )
-        self.train_service = TrainService(
-            self.config, self.gpu_manager, self.label_store, self.registry
-        )
+        # Stop running inference so the new project can use the GPU immediately
+        if self.inference_service.is_running:
+            logger.warning(
+                "Inference is running — stopping before project switch to '%s'.",
+                project_id,
+            )
+            self.inference_service.stop_inference()
+
+        with self._switch_lock:
+            self.active_project_id = project_id
+            self.label_store = LabelStore(
+                project_dir / "labels.gpkg",
+                local_cache_dir=self.config.paths.gpkg_cache_dir,
+            )
+            self.registry = ModelRegistry(
+                self.config.paths.checkpoint_dir, project_id=project_id
+            )
+            self.train_service = TrainService(
+                self.config, self.gpu_manager, self.label_store, self.registry
+            )
         logger.info("Switched to project '%s'", project_id)
 
 
@@ -259,11 +347,21 @@ def create_app() -> FastAPI:
     else:
         logger.info("Dashboard disabled via HITL_ENABLE_DASHBOARD.")
 
+    # Paths that bypass the session-lock check (bearer auth still required for most).
+    _SESSION_EXEMPT = frozenset({
+        "/api/session/acquire",
+        "/api/session/release",
+        "/api/session/heartbeat",
+        "/api/session/status",
+        "/api/status",  # connect/health-check always succeeds; shows session info
+    })
+
     # API key auth middleware
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
         path = request.url.path
-        # Open API (no keys configured) — set default identity and pass through
+        # Open API (no keys configured) — set default identity and pass through.
+        # Session lock is not enforced in open-API mode.
         if not _key_registry:
             request.state.user_id = "default"
             request.state.is_admin = True
@@ -286,14 +384,41 @@ def create_app() -> FastAPI:
             return JSONResponse(
                 status_code=401, content={"detail": "Invalid or missing API key"}
             )
-        token = auth[7:]
-        entry = _key_registry.get(token)
+        bearer = auth[7:]
+        entry = _key_registry.get(bearer)
         if entry is None:
             return JSONResponse(
                 status_code=401, content={"detail": "Invalid or missing API key"}
             )
         request.state.user_id = entry["user_id"]
         request.state.is_admin = entry.get("is_admin", False)
+
+        # Session-lock check: if someone holds the instance, everyone else gets 409.
+        if path not in _SESSION_EXEMPT and app_state is not None:
+            sess = app_state._instance_session
+            if sess is not None:
+                now = datetime.now()
+                idle = (now - sess.last_heartbeat).total_seconds()
+                if idle > SESSION_IDLE_TIMEOUT_S:
+                    # Auto-expire and allow the request through.
+                    app_state.release_session(force=True)
+                else:
+                    session_token = request.headers.get("X-Session-Token", "")
+                    if session_token != sess.token:
+                        return JSONResponse(
+                            status_code=409,
+                            content={
+                                "detail": (
+                                    f"Instance is in use by '{sess.user_id}' "
+                                    f"(acquired {sess.acquired_at.isoformat()}). "
+                                    "Call POST /api/session/acquire to wait or check status."
+                                ),
+                                "held_by": sess.user_id,
+                                "acquired_at": sess.acquired_at.isoformat(),
+                                "idle_seconds": idle,
+                            },
+                        )
+
         return await call_next(request)
 
     # Mount API routes
@@ -318,6 +443,19 @@ def create_app() -> FastAPI:
             gpu_name = props.name
             vram_total_mb = props.total_memory / (1024 * 1024)
             vram_used_mb = gpu.vram_usage_mb()
+
+        sess = app_state._instance_session
+        session_info: dict = {"held": False}
+        if sess is not None:
+            idle = (datetime.now() - sess.last_heartbeat).total_seconds()
+            if idle <= SESSION_IDLE_TIMEOUT_S:
+                session_info = {
+                    "held": True,
+                    "held_by": sess.user_id,
+                    "acquired_at": sess.acquired_at.isoformat(),
+                    "idle_seconds": idle,
+                }
+
         return {
             "status": "ok",
             "user_id": getattr(request.state, "user_id", "default"),
@@ -326,6 +464,7 @@ def create_app() -> FastAPI:
             "gpu_vram_total_mb": vram_total_mb,
             "gpu_vram_used_mb": vram_used_mb,
             "project": app_state.active_project_id,
+            "session": session_info,
         }
 
     return app

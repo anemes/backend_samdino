@@ -8,7 +8,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, Request
 
-from .deps import get_current_user, resolve_project_role
+from .deps import get_current_user, require_active_project_visibility, resolve_project_role
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ def get_deps():
 
 
 @router.get("/list")
-def list_models(state=Depends(get_deps)):
+def list_models(state=Depends(get_deps), _user=Depends(require_active_project_visibility)):
     """List all saved checkpoints."""
     return {
         "checkpoints": state.registry.list_checkpoints(),
@@ -33,7 +33,7 @@ def list_models(state=Depends(get_deps)):
 
 
 @router.get("/best")
-def get_best_model(state=Depends(get_deps)):
+def get_best_model(state=Depends(get_deps), _user=Depends(require_active_project_visibility)):
     """Get the best checkpoint (highest val_mIoU)."""
     best = state.registry.get_best_checkpoint()
     if best is None:

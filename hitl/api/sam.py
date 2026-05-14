@@ -14,13 +14,13 @@ import base64
 import io
 import logging
 import shutil
-import tempfile
 from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from .deps import require_active_project_contributor
 
@@ -63,6 +63,8 @@ def get_sam_service():
 def get_label_store():
     from ..app import app_state
 
+    if app_state is None:
+        raise HTTPException(status_code=503, detail="Backend not initialized")
     return app_state.label_store
 
 
@@ -95,11 +97,16 @@ async def set_image(
 
     suffix = Path(file.filename).suffix if file.filename else ".tif"
     upload_path = upload_dir / f"sam_image{suffix}"
-    with open(upload_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+
+    # File copy and SAM embedding are both blocking (disk I/O + GPU compute).
+    # Run them in a threadpool so the uvicorn event loop stays responsive.
+    def _copy_and_embed():
+        with open(upload_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        return sam.set_image(str(upload_path))
 
     try:
-        session = sam.set_image(str(upload_path))
+        session = await run_in_threadpool(_copy_and_embed)
         return {
             "status": "ok",
             "session_id": session.session_id,
@@ -213,12 +220,7 @@ def accept_mask(
         logger.warning("Failed to save raw SAM mask for annotation %d", idx, exc_info=True)
 
     # Reset prompts for next object (keep image loaded)
-    session = sam.session
-    session.point_coords = []
-    session.point_labels = []
-    session.box = None
-    session.current_mask = None
-    session.current_score = 0.0
+    sam.reset_prompts()
 
     return {
         "status": "ok",

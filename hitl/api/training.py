@@ -7,7 +7,7 @@ from typing import Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from .deps import require_active_project_contributor
+from .deps import require_active_project_contributor, require_active_project_visibility
 
 router = APIRouter()
 
@@ -81,18 +81,18 @@ def stop_training(state=Depends(get_deps), _user=Depends(require_active_project_
 
 
 @router.get("/status")
-def training_status(state=Depends(get_deps)):
+def training_status(state=Depends(get_deps), _user=Depends(require_active_project_visibility)):
     """Get current training state."""
     return state.train_service.get_state()
 
 
 @router.get("/metrics/{run_id}")
-def get_metrics(run_id: str, state=Depends(get_deps)):
+def get_metrics(run_id: str, state=Depends(get_deps), _user=Depends(require_active_project_visibility)):
     """Get all metrics for a training run."""
     return {"metrics": state.registry.get_metrics(run_id=run_id)}
 
 
 @router.get("/metrics")
-def get_all_metrics(state=Depends(get_deps)):
+def get_all_metrics(state=Depends(get_deps), _user=Depends(require_active_project_visibility)):
     """Get all metrics across all runs."""
     return {"metrics": state.registry.get_metrics()}

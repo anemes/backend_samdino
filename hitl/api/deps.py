@@ -73,3 +73,29 @@ def require_active_project_contributor(
         raise HTTPException(status_code=404, detail=f"Active project '{project_id}' not found")
     require_project_contributor(user, info, project_id)
     return user
+
+
+def require_active_project_visibility(
+    request: Request,
+    state=Depends(get_app_state),
+) -> dict:
+    """Dependency: verify the caller can see the active project (any role).
+
+    Inject on read endpoints that return data for the globally active project.
+    Prevents a user from reading another project's labels/models simply because
+    a different user switched the active project to one they don't own.
+
+    In open-API mode (no key registry) all users are admin, so this is a no-op.
+    """
+    user = get_current_user(request)
+    project_id = state.active_project_id
+    info = state.project_manager.get_project(project_id)
+    if info is None:
+        raise HTTPException(status_code=404, detail=f"Active project '{project_id}' not found")
+    role = resolve_project_role(user, info)
+    if role is None:
+        raise HTTPException(
+            status_code=403,
+            detail=f"No access to active project '{project_id}'",
+        )
+    return user

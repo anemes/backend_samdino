@@ -11,9 +11,10 @@ from typing import Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from ..data.label_store import SegClass
-from .deps import get_current_user, resolve_project_role
+from .deps import get_current_user, require_active_project_contributor, resolve_project_role
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,10 @@ def _resolve_checkpoint_classes(
 ) -> Tuple[int, List[str], Dict[int, int], List[str]]:
     """Match checkpoint classes to project classes by name.
 
+    May add missing checkpoint classes to the project's class list and persist
+    them via store.set_classes().  Works on a copy of user_classes so that the
+    caller's list is never silently mutated — only store is updated on disk.
+
     Returns:
         ckpt_num_classes: num_classes to build the model with (from checkpoint)
         ckpt_class_names: class name list for the checkpoint model
@@ -99,6 +104,8 @@ def _resolve_checkpoint_classes(
         warnings: list of warning messages
     """
     warnings: List[str] = []
+    # Work on a copy so the caller's list is never mutated in place.
+    user_classes = list(user_classes)
 
     if not checkpoint_record:
         # No checkpoint — use project classes directly, no remapping
@@ -164,7 +171,12 @@ def _resolve_checkpoint_classes(
 
 
 @router.post("/predict")
-def start_prediction(req: PredictRequest, request: Request, state=Depends(get_deps)):
+def start_prediction(
+    req: PredictRequest,
+    request: Request,
+    state=Depends(get_deps),
+    _user=Depends(require_active_project_contributor),
+):
     """Start tiled inference on an AOI."""
     from ..data.raster_source import GeoTIFFSource
 
@@ -243,6 +255,7 @@ async def start_prediction_upload(
     checkpoint_project_id: Optional[str] = Form(None),  # source project for cross-project checkpoints
     checkpoint_type: str = Form("best"),
     state=Depends(get_deps),
+    _user=Depends(require_active_project_contributor),
 ):
     """Start tiled inference from an uploaded GeoTIFF (e.g. QGIS viewport capture).
 
@@ -267,13 +280,18 @@ async def start_prediction_upload(
     except (json.JSONDecodeError, ValueError) as e:
         raise HTTPException(status_code=400, detail=f"Invalid aoi_bounds: {e}")
 
-    # Save uploaded file
+    # Save uploaded file — run in threadpool so blocking file I/O doesn't stall
+    # the event loop while the (potentially large) GeoTIFF is being written.
     upload_dir = Path(state.config.paths.dataset_cache_dir) / "inference_uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
     suffix = Path(file.filename).suffix if file.filename else ".tif"
     upload_path = upload_dir / f"upload{suffix}"
-    with open(upload_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+
+    def _write_upload():
+        with open(upload_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+
+    await run_in_threadpool(_write_upload)
 
     raster_source = GeoTIFFSource(str(upload_path))
 

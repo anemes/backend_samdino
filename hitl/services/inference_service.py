@@ -31,12 +31,13 @@ class InferenceState:
     """Shared inference state for API polling."""
 
     job_id: str = ""
-    status: str = "idle"  # idle, running, complete, error
+    status: str = "idle"  # idle, running, complete, cancelled, error
     tiles_processed: int = 0
     tiles_total: int = 0
     progress_pct: float = 0.0
     result_paths: Dict[str, str] = field(default_factory=dict)
     error_message: str = ""
+    warnings: List[str] = field(default_factory=list)
 
 
 class InferenceService:
@@ -53,6 +54,7 @@ class InferenceService:
         self.gpu = gpu_manager
         self._state = InferenceState()
         self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
 
     @property
     def state(self) -> InferenceState:
@@ -61,6 +63,17 @@ class InferenceService:
     @property
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    def stop_inference(self) -> None:
+        """Request cancellation of the running inference job.
+
+        Sets the stop event; the inference loop checks it between batches and
+        exits cleanly.  Returns immediately — the thread may still be alive
+        briefly while it finishes the current batch.
+        """
+        if self.is_running:
+            logger.info("Requesting inference cancellation")
+            self._stop_event.set()
 
     def start_inference(
         self,
@@ -76,6 +89,7 @@ class InferenceService:
         if self.is_running:
             raise RuntimeError("Inference already in progress")
 
+        self._stop_event.clear()
         job_id = f"infer_{uuid.uuid4().hex[:8]}"
         self._state = InferenceState(job_id=job_id, status="running")
 
@@ -97,6 +111,7 @@ class InferenceService:
             "progress_pct": self._state.progress_pct,
             "result_paths": self._state.result_paths,
             "error_message": self._state.error_message,
+            "warnings": self._state.warnings,
         }
 
     def _inference_loop(
@@ -149,6 +164,10 @@ class InferenceService:
 
             with torch.no_grad():
                 for i in range(0, len(tiles), batch_size):
+                    if self._stop_event.is_set():
+                        logger.info("Inference cancelled after %d/%d tiles", i, len(tiles))
+                        self._state.status = "cancelled"
+                        return
                     batch_tiles = tiles[i : i + batch_size]
 
                     # Prepare batch
@@ -227,6 +246,10 @@ class InferenceService:
             manifest_path.write_text(json.dumps(manifest, indent=2))
 
             self._state.result_paths = result_paths
+            if inf_cfg.output_vectors and "vector" not in result_paths:
+                msg = "Vector export failed (see server logs). Promote-inference will not be available."
+                self._state.warnings.append(msg)
+                logger.warning(msg)
             self._state.status = "complete"
             logger.info("Inference complete: %s", result_paths)
 

@@ -159,6 +159,8 @@ class LabelStore:
         if self.ANNOTATIONS_LAYER not in layers:
             self._create_empty_layer(self.ANNOTATIONS_LAYER)
             layers.add(self.ANNOTATIONS_LAYER)
+        else:
+            self._ensure_ann_id_column()
 
         if self.REGIONS_LAYER not in layers:
             self._create_empty_layer(self.REGIONS_LAYER)
@@ -177,6 +179,7 @@ class LabelStore:
             schema = {
                 "geometry": "MultiPolygon",
                 "properties": {
+                    "ann_id": "int",
                     "class_id": "int",
                     "region_id": "int",
                     "source": "str",
@@ -207,10 +210,34 @@ class LabelStore:
                 pass
             self._push_to_remote()
 
+    def _ensure_ann_id_column(self) -> None:
+        """Backward-compat migration: add ann_id to an existing annotations layer.
+
+        Existing rows get ann_id assigned sequentially from 0.  This runs once
+        at LabelStore construction time when an old-format GPKG is opened.
+        """
+        try:
+            gdf = self._read_layer(self.ANNOTATIONS_LAYER, crs="EPSG:4326")
+            if "ann_id" not in gdf.columns:
+                gdf = gdf.copy()
+                gdf["ann_id"] = range(len(gdf))
+                self._write_layer(gdf, layer=self.ANNOTATIONS_LAYER, mode="w")
+                logger.info(
+                    "Migrated annotations in %s: added ann_id column (%d rows)",
+                    self.path,
+                    len(gdf),
+                )
+        except Exception as exc:
+            if not self._is_missing_layer_error(exc):
+                logger.warning(
+                    "Could not migrate ann_id column in %s: %s", self.path, exc
+                )
+
     @staticmethod
     def _empty_annotations_gdf(crs: str) -> gpd.GeoDataFrame:
         return gpd.GeoDataFrame(
             {
+                "ann_id": pd.Series(dtype="int64"),
                 "class_id": pd.Series(dtype="int64"),
                 "region_id": pd.Series(dtype="int64"),
                 "source": pd.Series(dtype="str"),
@@ -348,6 +375,35 @@ class LabelStore:
         except Exception:
             return 0
 
+    def _max_id_in_layer(self, layer: str, column: str) -> int:
+        """Return max(column) in layer, or 0 if empty/missing.
+
+        Uses fiona to iterate properties without loading geometry for speed.
+        Safe to call while already holding _io_lock (it is an RLock).
+        """
+        if not self.path.exists():
+            return 0
+        if fiona is not None:
+            try:
+                with self._io_lock:
+                    with fiona.open(self.path, layer=layer, mode="r") as src:
+                        if len(src) == 0:
+                            return 0
+                        return max(
+                            (feat["properties"].get(column) or 0 for feat in src),
+                            default=0,
+                        )
+            except Exception:
+                return 0
+        # Fallback: full read
+        try:
+            gdf = self._read_layer(layer, crs="EPSG:4326")
+            if len(gdf) == 0 or column not in gdf.columns:
+                return 0
+            return int(gdf[column].max())
+        except Exception:
+            return 0
+
     @staticmethod
     def _is_locked_error(exc: Exception) -> bool:
         msg = str(exc).lower()
@@ -405,21 +461,26 @@ class LabelStore:
     def add_region(
         self, geometry_geojson: dict, crs: str = "EPSG:4326", status: str = "active",
     ) -> int:
-        """Add an annotation region. Returns assigned region_id."""
-        region_id = self._count_layer(self.REGIONS_LAYER) + 1
+        """Add an annotation region. Returns assigned region_id.
 
-        new_row = gpd.GeoDataFrame(
-            [
-                {
-                    "geometry": shape(geometry_geojson),
-                    "region_id": region_id,
-                    "created_at": datetime.now().isoformat(),
-                    "status": status,
-                }
-            ],
-            crs=crs,
-        )
-        self._write_layer(new_row, layer=self.REGIONS_LAYER, mode="a")
+        Uses max(existing region_ids)+1 so that IDs remain unique even after
+        deletions (count-based would reuse IDs after any delete).
+        The read and write happen under _io_lock (RLock) to be atomic.
+        """
+        with self._io_lock:
+            region_id = self._max_id_in_layer(self.REGIONS_LAYER, "region_id") + 1
+            new_row = gpd.GeoDataFrame(
+                [
+                    {
+                        "geometry": shape(geometry_geojson),
+                        "region_id": region_id,
+                        "created_at": datetime.now().isoformat(),
+                        "status": status,
+                    }
+                ],
+                crs=crs,
+            )
+            self._write_layer(new_row, layer=self.REGIONS_LAYER, mode="a")
         logger.info("Added annotation region %d (status=%s)", region_id, status)
         return region_id
 
@@ -445,25 +506,30 @@ class LabelStore:
         iteration: int = 0,
         status: str = "approved",
     ) -> int:
-        """Add a labeled polygon annotation. Returns row index."""
-        index = self._count_layer(self.ANNOTATIONS_LAYER)
+        """Add a labeled polygon annotation. Returns the stable ann_id.
 
-        new_row = gpd.GeoDataFrame(
-            [
-                {
-                    "geometry": shape(geometry_geojson),
-                    "class_id": class_id,
-                    "region_id": region_id,
-                    "source": source,
-                    "iteration": iteration,
-                    "created_at": datetime.now().isoformat(),
-                    "status": status,
-                }
-            ],
-            crs=crs,
-        )
-        self._write_layer(new_row, layer=self.ANNOTATIONS_LAYER, mode="a")
-        return index
+        ann_id is max(existing ann_ids)+1, computed atomically under _io_lock
+        so that concurrent adds never collide and deletions never cause reuse.
+        """
+        with self._io_lock:
+            ann_id = self._max_id_in_layer(self.ANNOTATIONS_LAYER, "ann_id") + 1
+            new_row = gpd.GeoDataFrame(
+                [
+                    {
+                        "ann_id": ann_id,
+                        "geometry": shape(geometry_geojson),
+                        "class_id": class_id,
+                        "region_id": region_id,
+                        "source": source,
+                        "iteration": iteration,
+                        "created_at": datetime.now().isoformat(),
+                        "status": status,
+                    }
+                ],
+                crs=crs,
+            )
+            self._write_layer(new_row, layer=self.ANNOTATIONS_LAYER, mode="a")
+        return ann_id
 
     def get_annotations(
         self,
@@ -491,14 +557,26 @@ class LabelStore:
         logger.info("Deleted %d annotations from region %d", deleted, region_id)
         return deleted
 
-    def delete_annotation(self, annotation_index: int) -> bool:
-        """Delete a single annotation by its index. Returns True if deleted."""
+    def delete_annotation(self, ann_id: int) -> bool:
+        """Delete a single annotation by its stable ann_id. Returns True if deleted.
+
+        Deletes by ann_id (a stable column), not by DataFrame row position, so
+        concurrent deletes cannot shift indices and remove the wrong annotation.
+        Falls back to positional deletion for legacy GeoPackages that lack ann_id.
+        """
         gdf = self.get_annotations()
-        if annotation_index < 0 or annotation_index >= len(gdf):
-            return False
-        gdf = gdf.drop(gdf.index[annotation_index]).reset_index(drop=True)
+        if "ann_id" in gdf.columns:
+            mask = gdf["ann_id"] == ann_id
+            if not mask.any():
+                return False
+            gdf = gdf[~mask].reset_index(drop=True)
+        else:
+            # Legacy fallback: positional index (pre-migration GeoPackage).
+            if ann_id < 0 or ann_id >= len(gdf):
+                return False
+            gdf = gdf.drop(gdf.index[ann_id]).reset_index(drop=True)
         self._write_layer(gdf, layer=self.ANNOTATIONS_LAYER, mode="w")
-        logger.info("Deleted annotation at index %d", annotation_index)
+        logger.info("Deleted annotation ann_id=%d", ann_id)
         return True
 
     def delete_region(self, region_id: int) -> int:

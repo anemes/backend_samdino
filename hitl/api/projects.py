@@ -54,7 +54,7 @@ def create_project(req: CreateProjectRequest, request: Request, pm=Depends(get_p
         info = pm.create_project(req.project_id, req.name, req.description, owner=user["user_id"])
         return {"status": "ok", "project": info.to_dict()}
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=422, detail=str(e))
 
 
 @router.post("/switch")

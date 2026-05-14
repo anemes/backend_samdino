@@ -9,7 +9,12 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
 from pydantic import BaseModel
 
-from .deps import get_current_user, require_active_project_contributor
+from .deps import (
+    get_current_user,
+    require_active_project_contributor,
+    require_active_project_visibility,
+    resolve_project_role,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +78,7 @@ def get_state():
 # --- Classes ---
 
 @router.get("/classes")
-def get_classes(store=Depends(get_label_store)):
+def get_classes(store=Depends(get_label_store), _user=Depends(require_active_project_visibility)):
     return {"classes": [{"class_id": c.class_id, "name": c.name, "color": c.color}
                         for c in store.get_classes()]}
 
@@ -82,14 +87,17 @@ def get_classes(store=Depends(get_label_store)):
 def set_classes(req: ClassesRequest, store=Depends(get_label_store), _user=Depends(require_active_project_contributor)):
     from ..data.label_store import SegClass
     classes = [SegClass(class_id=c.class_id, name=c.name, color=c.color) for c in req.classes]
-    store.set_classes(classes)
+    try:
+        store.set_classes(classes)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     return {"status": "ok", "num_classes": len(classes)}
 
 
 # --- Regions ---
 
 @router.get("/regions")
-def get_regions(crs: str = "EPSG:4326", store=Depends(get_label_store)):
+def get_regions(crs: str = "EPSG:4326", store=Depends(get_label_store), _user=Depends(require_active_project_visibility)):
     regions = store.get_regions(crs=crs)
     features = []
     for _, row in regions.iterrows():
@@ -104,6 +112,12 @@ def get_regions(crs: str = "EPSG:4326", store=Depends(get_label_store)):
 
 @router.post("/regions")
 def add_region(req: RegionRequest, store=Depends(get_label_store), _user=Depends(require_active_project_contributor)):
+    geom_type = req.geometry_geojson.get("type", "")
+    if geom_type not in ("Polygon", "MultiPolygon"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Region geometry must be Polygon or MultiPolygon, got '{geom_type}'",
+        )
     region_id = store.add_region(req.geometry_geojson, crs=req.crs)
     return {"region_id": region_id}
 
@@ -116,6 +130,7 @@ def get_annotations(
     status: Optional[str] = None,
     crs: str = "EPSG:4326",
     store=Depends(get_label_store),
+    _user=Depends(require_active_project_visibility),
 ):
     annotations = store.get_annotations(region_id=region_id, crs=crs, status=status)
     features = []
@@ -167,6 +182,9 @@ def delete_annotation(annotation_index: int, store=Depends(get_label_store), _us
     ok = store.delete_annotation(annotation_index)
     if not ok:
         raise HTTPException(status_code=404, detail="Annotation not found")
+    # Remove any SAM mask that was saved alongside this annotation.
+    mask_path = store.project_dir / "sam_masks" / f"ann_{annotation_index:06d}.tif"
+    mask_path.unlink(missing_ok=True)
     return {"status": "ok"}
 
 
@@ -219,7 +237,12 @@ def promote_inference(req: PromoteInferenceRequest, request: Request, state=Depe
 
     vec_path = inf_state.result_paths.get("vector")
     if not vec_path:
-        raise HTTPException(status_code=404, detail="No vector results for this job")
+        warnings = getattr(inf_state, "warnings", [])
+        detail = next((w for w in warnings if "Vector export" in w), None)
+        raise HTTPException(
+            status_code=409,
+            detail=detail or "No vector results for this job (vector export may have failed)",
+        )
 
     # Resolve target project, rewriting the legacy '_inference' sentinel
     target_project = req.project_id or state.active_project_id
@@ -237,6 +260,17 @@ def promote_inference(req: PromoteInferenceRequest, request: Request, state=Depe
                 pm.create_project(target_project, target_project, owner=user["user_id"])
             else:
                 raise HTTPException(status_code=404, detail=f"Project '{target_project}' not found")
+        else:
+            # Enforce contributor access on the target project when it differs
+            # from the active project.  _inference_* projects are per-user and
+            # owned by the caller, so no extra check is needed for those.
+            if not target_project.startswith("_inference"):
+                info = pm.get_project(target_project)
+                if info is None or resolve_project_role(user, info) != "contributor":
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Contributor access required on project '{target_project}'",
+                    )
         store = LabelStore(
             project_dir / "labels.gpkg",
             local_cache_dir=state.config.paths.gpkg_cache_dir,
@@ -260,6 +294,24 @@ def promote_inference(req: PromoteInferenceRequest, request: Request, state=Depe
             "region_id": region_id,
             "annotations_created": 0,
             "message": "Region created but no class predictions to promote",
+        }
+
+    # Clip predictions to the submitted AOI polygon.  Edge tiles can extend
+    # slightly beyond the AOI boundary; clipping prevents stray fragments from
+    # being promoted as annotations outside the intended review area.
+    from shapely.geometry import shape as shapely_shape
+    try:
+        aoi_shape = shapely_shape(req.aoi_geojson)
+        pred_gdf = pred_gdf.clip(aoi_shape)
+        pred_gdf = pred_gdf[~pred_gdf.geometry.is_empty]
+    except Exception:
+        logger.warning("AOI clip failed — skipping clip step", exc_info=True)
+
+    if len(pred_gdf) == 0:
+        return {
+            "region_id": region_id,
+            "annotations_created": 0,
+            "message": "Region created but all predictions were outside the AOI boundary",
         }
 
     # Round coordinates to 6 decimal places to avoid WKT parser overflow
@@ -294,7 +346,7 @@ def approve_region(region_id: int, store=Depends(get_label_store), _user=Depends
 
 
 @router.get("/stats")
-def get_stats(store=Depends(get_label_store)):
+def get_stats(store=Depends(get_label_store), _user=Depends(require_active_project_visibility)):
     return store.get_stats()
 
 
