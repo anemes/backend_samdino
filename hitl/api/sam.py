@@ -115,6 +115,7 @@ async def set_image(
 def prompt(
     req: PromptRequest,
     sam=Depends(get_sam_service),
+    _user=Depends(require_active_project_contributor),
 ):
     """Send a point/box prompt and get a mask prediction.
 

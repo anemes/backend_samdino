@@ -67,6 +67,9 @@ def require_active_project_contributor(
     resolved user dict so callers can use it if needed.
     """
     user = get_current_user(request)
-    info = state.project_manager.get_project(state.active_project_id)
-    require_project_contributor(user, info, state.active_project_id)
+    project_id = state.active_project_id
+    info = state.project_manager.get_project(project_id)
+    if info is None:
+        raise HTTPException(status_code=404, detail=f"Active project '{project_id}' not found")
+    require_project_contributor(user, info, project_id)
     return user

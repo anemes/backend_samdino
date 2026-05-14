@@ -192,7 +192,8 @@ class PromoteInferenceRequest(BaseModel):
 
 
 @router.post("/promote-inference")
-def promote_inference(req: PromoteInferenceRequest, request: Request, state=Depends(get_state)):
+def promote_inference(req: PromoteInferenceRequest, request: Request, state=Depends(get_state),
+                      _user=Depends(require_active_project_contributor)):
     """Promote inference results to in-review annotations.
 
     Creates a region (status='in_review') from the AOI polygon, then reads the
