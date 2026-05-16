@@ -227,10 +227,10 @@ class XYZTileSource(RasterSource):
         px_per_m_x = mw / (mb_maxx - mb_minx)
         px_per_m_y = mh / (mb_maxy - mb_miny)
 
-        col0 = int((bounds[0] - mb_minx) * px_per_m_x)
-        col1 = int((bounds[2] - mb_minx) * px_per_m_x)
-        row0 = int((mb_maxy - bounds[3]) * px_per_m_y)  # Y is flipped (top=maxy)
-        row1 = int((mb_maxy - bounds[1]) * px_per_m_y)
+        col0 = round((bounds[0] - mb_minx) * px_per_m_x)
+        col1 = round((bounds[2] - mb_minx) * px_per_m_x)
+        row0 = round((mb_maxy - bounds[3]) * px_per_m_y)  # Y is flipped (top=maxy)
+        row1 = round((mb_maxy - bounds[1]) * px_per_m_y)
 
         # Clamp to mosaic dimensions
         col0 = max(0, min(col0, mw))

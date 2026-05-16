@@ -180,7 +180,7 @@ def get_raster_source(source_id: str, state=None):
             zoom=info["default_zoom"],
             cache_dir=info.get("cache_dir"),
             rate_limit=info.get("rate_limit", 10.0),
-            headers=info.get("_headers") or info.get("headers"),  # back-compat
+            headers=info.get("_headers"),
         )
 
     raise ValueError(f"Unsupported source type: {info['source_type']}")

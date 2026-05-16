@@ -37,13 +37,6 @@ def get_deps():
     return app_state
 
 
-def _resolve_inference_project(project_id: str, user: dict) -> str:
-    """Rewrite the legacy '_inference' sentinel to the per-user project id."""
-    if project_id == "_inference":
-        return f"_inference_{user['user_id']}"
-    return project_id
-
-
 def _open_label_store(state, project_id: str, user: dict, auto_create: bool = False):
     """Open a LabelStore for *project_id* without switching the active project.
 
@@ -185,8 +178,7 @@ def start_prediction(
 
     user = get_current_user(request)
 
-    # Rewrite '_inference' sentinel to per-user project id
-    effective_project_id = _resolve_inference_project(req.project_id, user)
+    effective_project_id = req.project_id
 
     if req.xyz_url:
         from ..data.raster_source import XYZTileSource
@@ -269,8 +261,7 @@ async def start_prediction_upload(
 
     user = get_current_user(request)
 
-    # Rewrite '_inference' sentinel to per-user project id
-    effective_project_id = _resolve_inference_project(project_id, user)
+    effective_project_id = project_id
 
     # Parse AOI bounds from JSON string
     try:

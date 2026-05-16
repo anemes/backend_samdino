@@ -32,6 +32,7 @@ class InferenceState:
 
     job_id: str = ""
     status: str = "idle"  # idle, running, complete, cancelled, error
+    stage: str = ""  # loading_model, fetching_tiles, inferring, exporting
     tiles_processed: int = 0
     tiles_total: int = 0
     progress_pct: float = 0.0
@@ -106,6 +107,7 @@ class InferenceService:
         return {
             "job_id": self._state.job_id,
             "status": self._state.status,
+            "stage": self._state.stage,
             "tiles_processed": self._state.tiles_processed,
             "tiles_total": self._state.tiles_total,
             "progress_pct": self._state.progress_pct,
@@ -130,14 +132,18 @@ class InferenceService:
             dinov3_cfg = self.config.models.dinov3
 
             # Load model
+            self._state.stage = "loading_model"
             model = self.gpu.acquire_segmentor(self.config, num_classes)
             if checkpoint_path:
                 model.load_checkpoint(checkpoint_path)
             model.eval()
 
-            # Tile the AOI
+            # Tile the AOI (fetches imagery with margin for clean edges)
+            self._state.stage = "fetching_tiles"
             tiler = Tiler(patch_size=inf_cfg.tile_size, overlap=inf_cfg.tile_overlap)
-            tiles, output_shape = tiler.tile(raster_source, aoi_bounds)
+            tiles, output_shape, crop_box = tiler.tile(
+                raster_source, aoi_bounds, margin=inf_cfg.tile_overlap
+            )
 
             if len(tiles) == 0:
                 self._state.status = "error"
@@ -159,6 +165,7 @@ class InferenceService:
             )
 
             # Process tiles in batches
+            self._state.stage = "inferring"
             device = self.gpu.device
             batch_size = inf_cfg.batch_size
 
@@ -192,8 +199,12 @@ class InferenceService:
                     self._state.tiles_processed = min(i + batch_size, len(tiles))
                     self._state.progress_pct = self._state.tiles_processed / len(tiles) * 100
 
-            # Finalize
+            # Finalize and crop back to original AOI (remove the margin
+            # that was added for real edge context)
             class_map, confidence_map = stitcher.finalize()
+            t, l, h, w = crop_box
+            class_map = class_map[t:t + h, l:l + w]
+            confidence_map = confidence_map[t:t + h, l:l + w]
 
             # Remap checkpoint class indices → project class_ids
             if class_id_map:
@@ -214,6 +225,7 @@ class InferenceService:
                 logger.info("Remapped class indices: %s", class_id_map)
 
             # Export — use local disk to avoid SQLite locking on Azure Files (SMB)
+            self._state.stage = "exporting"
             cache = self.config.paths.gpkg_cache_dir
             if cache and str(cache).strip():
                 output_dir = Path(cache) / "predictions"

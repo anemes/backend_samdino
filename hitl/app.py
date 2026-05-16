@@ -215,15 +215,6 @@ async def lifespan(app: FastAPI):
     # Ensure reserved projects exist
     if project_manager.get_project("default") is None:
         project_manager.create_project("default", "Default Project", "Auto-created default project", owner="_system")
-    # Per-user _inference_{user_id} projects are created lazily on first inference.
-    # Create _inference_default for the legacy single-key deployment.
-    if project_manager.get_project("_inference_default") is None:
-        project_manager.create_project(
-            "_inference_default",
-            "Standalone Inference (default user)",
-            "Reserved project for standalone inference results (not used for training)",
-            owner="_system",
-        )
 
     default_project_dir = project_manager.get_project_dir("default")
     label_store = LabelStore(

@@ -159,8 +159,6 @@ class LabelStore:
         if self.ANNOTATIONS_LAYER not in layers:
             self._create_empty_layer(self.ANNOTATIONS_LAYER)
             layers.add(self.ANNOTATIONS_LAYER)
-        else:
-            self._ensure_ann_id_column()
 
         if self.REGIONS_LAYER not in layers:
             self._create_empty_layer(self.REGIONS_LAYER)
@@ -209,29 +207,6 @@ class LabelStore:
             ):
                 pass
             self._push_to_remote()
-
-    def _ensure_ann_id_column(self) -> None:
-        """Backward-compat migration: add ann_id to an existing annotations layer.
-
-        Existing rows get ann_id assigned sequentially from 0.  This runs once
-        at LabelStore construction time when an old-format GPKG is opened.
-        """
-        try:
-            gdf = self._read_layer(self.ANNOTATIONS_LAYER, crs="EPSG:4326")
-            if "ann_id" not in gdf.columns:
-                gdf = gdf.copy()
-                gdf["ann_id"] = range(len(gdf))
-                self._write_layer(gdf, layer=self.ANNOTATIONS_LAYER, mode="w")
-                logger.info(
-                    "Migrated annotations in %s: added ann_id column (%d rows)",
-                    self.path,
-                    len(gdf),
-                )
-        except Exception as exc:
-            if not self._is_missing_layer_error(exc):
-                logger.warning(
-                    "Could not migrate ann_id column in %s: %s", self.path, exc
-                )
 
     @staticmethod
     def _empty_annotations_gdf(crs: str) -> gpd.GeoDataFrame:
@@ -414,14 +389,6 @@ class LabelStore:
             or "sqlite busy" in msg
         )
 
-    @staticmethod
-    def _ensure_status_column(gdf: gpd.GeoDataFrame, default: str) -> gpd.GeoDataFrame:
-        """Add status column with default value if missing (backward compat)."""
-        if "status" not in gdf.columns:
-            gdf["status"] = default
-        else:
-            gdf["status"] = gdf["status"].fillna(default)
-        return gdf
 
     # --- Class operations ---
 
@@ -489,7 +456,8 @@ class LabelStore:
     ) -> gpd.GeoDataFrame:
         """Get annotation regions, optionally filtered by status."""
         gdf = self._read_layer(self.REGIONS_LAYER, crs=crs)
-        gdf = self._ensure_status_column(gdf, "active")
+        if len(gdf) > 0:
+            gdf["status"] = gdf["status"].fillna("active")
         if status is not None and len(gdf) > 0:
             gdf = gdf[gdf["status"] == status]
         return gdf
@@ -539,7 +507,8 @@ class LabelStore:
     ) -> gpd.GeoDataFrame:
         """Get annotations, optionally filtered by region_id and/or status."""
         gdf = self._read_layer(self.ANNOTATIONS_LAYER, crs=crs)
-        gdf = self._ensure_status_column(gdf, "approved")
+        if len(gdf) > 0:
+            gdf["status"] = gdf["status"].fillna("approved")
         if region_id is not None and len(gdf) > 0:
             gdf = gdf[gdf["region_id"] == region_id]
         if status is not None and len(gdf) > 0:
@@ -558,23 +527,12 @@ class LabelStore:
         return deleted
 
     def delete_annotation(self, ann_id: int) -> bool:
-        """Delete a single annotation by its stable ann_id. Returns True if deleted.
-
-        Deletes by ann_id (a stable column), not by DataFrame row position, so
-        concurrent deletes cannot shift indices and remove the wrong annotation.
-        Falls back to positional deletion for legacy GeoPackages that lack ann_id.
-        """
+        """Delete a single annotation by its stable ann_id. Returns True if deleted."""
         gdf = self.get_annotations()
-        if "ann_id" in gdf.columns:
-            mask = gdf["ann_id"] == ann_id
-            if not mask.any():
-                return False
-            gdf = gdf[~mask].reset_index(drop=True)
-        else:
-            # Legacy fallback: positional index (pre-migration GeoPackage).
-            if ann_id < 0 or ann_id >= len(gdf):
-                return False
-            gdf = gdf.drop(gdf.index[ann_id]).reset_index(drop=True)
+        mask = gdf["ann_id"] == ann_id
+        if not mask.any():
+            return False
+        gdf = gdf[~mask].reset_index(drop=True)
         self._write_layer(gdf, layer=self.ANNOTATIONS_LAYER, mode="w")
         logger.info("Deleted annotation ann_id=%d", ann_id)
         return True
@@ -688,9 +646,11 @@ class LabelStore:
             logger.warning("No valid geometries to add after filtering")
             return 0
 
+        start_id = self._max_id_in_layer(self.ANNOTATIONS_LAYER, "ann_id") + 1
         new_rows = gpd.GeoDataFrame(
             [
                 {
+                    "ann_id": start_id + i,
                     "geometry": geom,
                     "class_id": cid,
                     "region_id": region_id,
@@ -699,7 +659,7 @@ class LabelStore:
                     "created_at": now,
                     "status": status,
                 }
-                for geom, cid in valid_pairs
+                for i, (geom, cid) in enumerate(valid_pairs)
             ],
             crs=crs,
         )

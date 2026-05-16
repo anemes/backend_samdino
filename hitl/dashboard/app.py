@@ -40,7 +40,7 @@ def create_dashboard():
         gpu = state.gpu_manager
         gpu_info = (
             f"Device: {gpu.device}\n"
-            f"Active model: {gpu.active_model.value}\n"
+            f"Loaded models: {', '.join(m.value for m in gpu.loaded_models) or 'none'}\n"
             f"VRAM usage: {gpu.vram_usage_mb():.0f} MB"
         )
 

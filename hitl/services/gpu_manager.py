@@ -80,15 +80,6 @@ class GPUManager:
                 )
 
     @property
-    def active_model(self) -> ActiveModel:
-        """Backward compat: returns the 'primary' active model."""
-        if ActiveModel.SEGMENTOR in self._loaded:
-            return ActiveModel.SEGMENTOR
-        if ActiveModel.SAM3 in self._loaded:
-            return ActiveModel.SAM3
-        return ActiveModel.NONE
-
-    @property
     def loaded_models(self) -> frozenset:
         """Set of currently loaded models."""
         return frozenset(self._loaded)
