@@ -33,7 +33,7 @@ dependencies = [
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     # Dashboard
-    "gradio>=4.40",
+    "gradio>=5.0,<6",
     # Utilities
     "tqdm>=4.66",
     "structlog>=24.0",

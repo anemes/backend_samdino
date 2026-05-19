@@ -6,8 +6,16 @@ import json
 import logging
 import os
 import secrets
+import sys
 import threading
 from contextlib import asynccontextmanager
+
+# When run via ``python -m hitl.app`` the module is registered as ``__main__``,
+# not ``hitl.app``.  Sub-modules that do ``from ..app import ...`` resolve to
+# ``hitl.app`` and would trigger a *second* import (circular).  Registering
+# early prevents the duplicate.
+if __name__ == "__main__":
+    sys.modules.setdefault("hitl.app", sys.modules[__name__])
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -329,6 +337,7 @@ def create_app() -> FastAPI:
                     dashboard,
                     path="/dashboard",
                     auth=auth,
+                    ssr_mode=False,
                 )
                 logger.info("Dashboard mounted at /dashboard")
             else:
@@ -477,9 +486,10 @@ if __name__ == "__main__":
         logger.warning("Invalid PORT=%r; falling back to %d", os.getenv("PORT"), config.server.port)
         port = config.server.port
 
+    reload = _env_bool("HITL_RELOAD", False)
     uvicorn.run(
-        "hitl.app:app",
+        "hitl.app:app" if reload else app,
         host=host,
         port=port,
-        reload=_env_bool("HITL_RELOAD", False),
+        reload=reload,
     )

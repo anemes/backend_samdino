@@ -136,6 +136,7 @@ def get_annotations(
     features = []
     for _, row in annotations.iterrows():
         features.append({
+            "ann_id": int(row["ann_id"]),
             "class_id": int(row["class_id"]),
             "region_id": int(row["region_id"]),
             "source": row.get("source", "manual"),
@@ -174,7 +175,7 @@ def add_annotation(req: AnnotationRequest, store=Depends(get_label_store), _user
         iteration=req.iteration,
         status=ann_status,
     )
-    return {"index": idx}
+    return {"ann_id": idx}
 
 
 @router.delete("/annotations/{annotation_index}")

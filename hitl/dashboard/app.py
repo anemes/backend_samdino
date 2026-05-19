@@ -606,7 +606,7 @@ def create_dashboard():
 
                     train_project = gr.Dropdown(
                         label="Project",
-                        choices=get_project_list(),
+                        choices=[],
                         value=None,
                         allow_custom_value=True,
                     )
@@ -717,7 +717,7 @@ def create_dashboard():
 
                     model_project = gr.Dropdown(
                         label="Project",
-                        choices=get_project_list(),
+                        choices=[],
                         value=None,
                     )
                     model_refresh_proj = gr.Button("Refresh Projects", size="sm")
@@ -810,7 +810,7 @@ def create_dashboard():
                 with gr.Column():
                     ds_project = gr.Dropdown(
                         label="Project",
-                        choices=get_project_list(),
+                        choices=[],
                         allow_custom_value=True,
                     )
                     ds_refresh_proj = gr.Button("Refresh Projects", size="sm")
@@ -850,7 +850,7 @@ def create_dashboard():
             with gr.Row():
                 stats_project = gr.Dropdown(
                     label="Project",
-                    choices=get_project_list(),
+                    choices=[],
                     allow_custom_value=True,
                 )
                 stats_refresh = gr.Button("Refresh", size="sm")
@@ -887,7 +887,7 @@ def create_dashboard():
                 with gr.Column(scale=1):
                     infer_selector = gr.Dropdown(
                         label="Inference Job",
-                        choices=list_inference_choices(),
+                        choices=[],
                         value=None,
                     )
                     infer_refresh_btn = gr.Button("Refresh", size="sm")

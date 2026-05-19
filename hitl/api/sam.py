@@ -224,7 +224,7 @@ def accept_mask(
 
     return {
         "status": "ok",
-        "annotation_index": idx,
+        "ann_id": idx,
         "geometry": polygon,
     }
 
