@@ -214,10 +214,12 @@ def accept_mask(
     masks_dir = store.project_dir / "sam_masks"
     masks_dir.mkdir(exist_ok=True)
     mask_path = masks_dir / f"ann_{idx:06d}.tif"
+    mask_saved = True
     try:
         sam.save_mask(str(mask_path), class_id=req.class_id)
     except Exception:
         logger.warning("Failed to save raw SAM mask for annotation %d", idx, exc_info=True)
+        mask_saved = False
 
     # Reset prompts for next object (keep image loaded)
     sam.reset_prompts()
@@ -226,6 +228,7 @@ def accept_mask(
         "status": "ok",
         "ann_id": idx,
         "geometry": polygon,
+        "mask_saved": mask_saved,
     }
 
 

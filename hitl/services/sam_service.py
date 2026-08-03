@@ -343,7 +343,16 @@ class SAMService:
         """Clear the current session (keeps SAM3 model loaded)."""
         if self._session is not None:
             logger.info("SAM3 session %s reset.", self._session.session_id)
+            if self._session.inference_state:
+                self._session.inference_state.clear()
+            self._session.current_mask = None
         self._session = None
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
 
     def get_session_info(self) -> dict:
         """Get current session state for API response."""

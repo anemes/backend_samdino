@@ -138,7 +138,8 @@ class GPUManager:
         """Unload a specific model and free its VRAM."""
         if model == ActiveModel.SAM3 and self._sam3_model is not None:
             logger.info("Unloading SAM3...")
-            del self._sam3_processor
+            if self._sam3_processor is not None:
+                del self._sam3_processor
             del self._sam3_model
             self._sam3_processor = None
             self._sam3_model = None

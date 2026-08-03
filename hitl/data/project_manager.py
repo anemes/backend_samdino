@@ -130,7 +130,7 @@ class ProjectManager:
         root = self.projects_dir.resolve()
         if not str(candidate).startswith(str(root)):
             raise ValueError(f"project_id {project_id!r} escapes the projects directory")
-        return self.projects_dir / project_id
+        return candidate
 
     def set_project_info(self, project_id: str, **updates) -> Optional[ProjectInfo]:
         """Partially update project.json fields.  Returns updated info or None."""

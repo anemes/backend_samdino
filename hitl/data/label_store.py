@@ -646,24 +646,25 @@ class LabelStore:
             logger.warning("No valid geometries to add after filtering")
             return 0
 
-        start_id = self._max_id_in_layer(self.ANNOTATIONS_LAYER, "ann_id") + 1
-        new_rows = gpd.GeoDataFrame(
-            [
-                {
-                    "ann_id": start_id + i,
-                    "geometry": geom,
-                    "class_id": cid,
-                    "region_id": region_id,
-                    "source": source,
-                    "iteration": iteration,
-                    "created_at": now,
-                    "status": status,
-                }
-                for i, (geom, cid) in enumerate(valid_pairs)
-            ],
-            crs=crs,
-        )
+        with self._io_lock:
+            start_id = self._max_id_in_layer(self.ANNOTATIONS_LAYER, "ann_id") + 1
+            new_rows = gpd.GeoDataFrame(
+                [
+                    {
+                        "ann_id": start_id + i,
+                        "geometry": geom,
+                        "class_id": cid,
+                        "region_id": region_id,
+                        "source": source,
+                        "iteration": iteration,
+                        "created_at": now,
+                        "status": status,
+                    }
+                    for i, (geom, cid) in enumerate(valid_pairs)
+                ],
+                crs=crs,
+            )
 
-        self._write_layer(new_rows, layer=self.ANNOTATIONS_LAYER, mode="a")
+            self._write_layer(new_rows, layer=self.ANNOTATIONS_LAYER, mode="a")
         logger.info("Bulk added %d annotations to region %d", len(valid_pairs), region_id)
         return len(valid_pairs)

@@ -154,6 +154,13 @@ def add_annotation(req: AnnotationRequest, store=Depends(get_label_store), _user
             status_code=400,
             detail="class_id must be >= 2 (0=ignore, 1=background are implicit)",
         )
+    # Validate class_id is defined
+    defined_ids = {c.class_id for c in store.get_classes()}
+    if defined_ids and req.class_id not in defined_ids:
+        raise HTTPException(
+            status_code=400,
+            detail=f"class_id {req.class_id} is not defined. Sync classes to backend first.",
+        )
     # Validate annotation is inside the target region
     if not store.check_annotation_in_region(
         req.geometry_geojson, req.region_id, crs=req.crs

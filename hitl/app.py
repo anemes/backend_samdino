@@ -159,27 +159,27 @@ class AppState:
         if not project_dir.exists():
             raise ValueError(f"Project '{project_id}' does not exist")
 
-        # Stop running training on the old project before switching
-        if self.train_service.is_running:
-            logger.warning(
-                "Training is running on project '%s' — stopping before switch.",
-                self.active_project_id,
-            )
-            self.train_service.stop_training()
-            if self.train_service._thread is not None:
-                self.train_service._thread.join(timeout=10)
-                if self.train_service._thread.is_alive():
-                    logger.warning("Training thread did not stop within 10s")
-
-        # Stop running inference so the new project can use the GPU immediately
-        if self.inference_service.is_running:
-            logger.warning(
-                "Inference is running — stopping before project switch to '%s'.",
-                project_id,
-            )
-            self.inference_service.stop_inference()
-
         with self._switch_lock:
+            # Stop running training on the old project before switching
+            if self.train_service.is_running:
+                logger.warning(
+                    "Training is running on project '%s' — stopping before switch.",
+                    self.active_project_id,
+                )
+                self.train_service.stop_training()
+                if self.train_service._thread is not None:
+                    self.train_service._thread.join(timeout=10)
+                    if self.train_service._thread.is_alive():
+                        logger.warning("Training thread did not stop within 10s")
+
+            # Stop running inference so the new project can use the GPU immediately
+            if self.inference_service.is_running:
+                logger.warning(
+                    "Inference is running — stopping before project switch to '%s'.",
+                    project_id,
+                )
+                self.inference_service.stop_inference()
+
             self.active_project_id = project_id
             self.label_store = LabelStore(
                 project_dir / "labels.gpkg",

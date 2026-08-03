@@ -376,6 +376,21 @@ class TrainService:
                         logger.info("Early stopping at epoch %d", epoch)
                         break
 
+            # Rotate old checkpoint directories (keep most recent N runs)
+            max_runs = getattr(self.config.training, "max_checkpoint_runs", 5)
+            try:
+                all_run_dirs = sorted(
+                    [d for d in ckpt_dir.parent.iterdir() if d.is_dir() and d.name.startswith("run_")],
+                    key=lambda p: p.stat().st_mtime,
+                )
+                while len(all_run_dirs) > max_runs:
+                    oldest = all_run_dirs.pop(0)
+                    import shutil
+                    shutil.rmtree(oldest, ignore_errors=True)
+                    logger.info("Rotated old checkpoint run: %s", oldest.name)
+            except Exception:
+                logger.debug("Checkpoint rotation failed", exc_info=True)
+
             self._state.status = "complete"
             logger.info("Training complete. Best val_mIoU=%.4f", best_val_mIoU)
 

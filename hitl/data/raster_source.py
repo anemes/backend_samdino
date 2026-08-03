@@ -238,6 +238,13 @@ class XYZTileSource(RasterSource):
         row0 = max(0, min(row0, mh))
         row1 = max(0, min(row1, mh))
 
+        if col0 >= col1 or row0 >= row1:
+            raise ValueError(
+                f"Crop bounds are empty after clamping: "
+                f"cols=[{col0},{col1}], rows=[{row0},{row1}], "
+                f"mosaic={mw}x{mh}, requested_bounds={bounds}"
+            )
+
         cropped = mosaic_img[:, row0:row1, col0:col1]
 
         # Resize to requested dimensions if needed

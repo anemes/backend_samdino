@@ -107,9 +107,12 @@ class DatasetBuilder:
 
         stats = DatasetStats(target_crs=target_crs)
 
-        # Read only approved regions and annotations for training
-        regions = self.label_store.get_regions(crs=target_crs, status="active")
-        annotations = self.label_store.get_annotations(crs=target_crs, status="approved")
+        # Always fetch labels in the raster source's native CRS so that
+        # resolution (in source CRS units) and geometry bounds are in the
+        # same coordinate system.
+        source_crs = raster_source.get_crs()
+        regions = self.label_store.get_regions(crs=source_crs, status="active")
+        annotations = self.label_store.get_annotations(crs=source_crs, status="approved")
         stats.num_regions = len(regions)
         stats.num_annotations = len(annotations)
 
