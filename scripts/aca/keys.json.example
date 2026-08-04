@@ -1,0 +1,18 @@
+[
+  {
+    "key": "sk-replace-with-a-long-random-string",
+    "user_id": "alice",
+    "label": "Alice Smith"
+  },
+  {
+    "key": "sk-another-long-random-string",
+    "user_id": "bob",
+    "label": "Bob Jones"
+  },
+  {
+    "key": "sk-operator-secret-key",
+    "user_id": "ops",
+    "label": "Operator",
+    "admin": true
+  }
+]
